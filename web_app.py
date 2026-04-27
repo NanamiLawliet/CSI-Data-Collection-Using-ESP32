@@ -93,42 +93,61 @@ class CSIDataLogger:
             raise
     
     def parse_csi_line(self, line):
-        """Extract CSI data from the ESP32's output format
+        """Extract CSI data from the ESP32's CSV output format
         
-        The ESP32 sends data in this format:
-        CSI_START{"rssi":-85,"rate":11,"channel":11,"bandwidth":0,"len":128,"timestamp":50136694,"csi_data":[...]}CSI_END
+        The ESP32 now sends data in CSV format:
+        CSI_DATA,timestamp,rssi,rate,channel,mac,len,magnitude,phase,csi_string
         
-        We need to:
-        1. Find the JSON data between CSI_START and CSI_END
-        2. Parse it into a Python dictionary
-        3. Return the parsed data or None if something goes wrong
+        We parse this CSV line and convert it to the same dict format expected by the rest of the code
         """
-        # Try different regex patterns to handle various formats
-        patterns = [
-            r'CSI_START(\{[^{}]*\})CSI_END',  # Original strict pattern
-            r'CSI_START(\{.*?\})CSI_END',     # Non-greedy pattern
-            r'\{["rssi".*?csi_data.*?\]\}'  # Direct JSON pattern
-        ]
+        if not line.startswith('CSI_DATA'):
+            return None
         
-        match = None
-        for pattern in patterns:
-            match = re.search(pattern, line)
-            if match:
-                break
-        
-        if match:
-            try:
-                json_str = match.group(1) if '"' in match.group(1) else match.group(0)
-                data = json.loads(json_str)
-                print(f"[SUCCESS] Parsed CSI packet: RSSI={data.get('rssi')}dBm, CH={data.get('channel')}, LEN={len(data.get('csi_data', []))} subcarriers")
-                return data
-            except json.JSONDecodeError as e:
-                print(f"[ERROR] JSON parse failed: {e}")
-                print(f"[ERROR] Attempted to parse: {json_str[:200]}...")
-        else:
-            print(f"[WARNING] No CSI_START/CSI_END found in: {line[:100]}...")
-        
-        return None
+        try:
+            # Split by comma but handle the last field (CSI array in quotes)
+            parts = line.split(',', 9)  # Max 9 splits = 10 fields
+            
+            if len(parts) < 10:
+                print(f"[WARNING] CSV line has fewer than 10 fields: {line[:100]}")
+                return None
+            
+            # Parse each field
+            timestamp = int(parts[1])
+            rssi = int(parts[2])
+            rate = int(parts[3])
+            channel = int(parts[4])
+            mac = parts[5]
+            csi_len = int(parts[6])
+            magnitude = int(parts[7])
+            phase = int(parts[8])
+            csi_string = parts[9]
+            
+            # Parse CSI array from string representation
+            # Remove quotes and square brackets, then convert to list
+            csi_string = csi_string.strip().strip('"').strip('[]')
+            csi_array = [int(x.strip()) for x in csi_string.split(',') if x.strip()]
+            
+            # Convert to the same format the rest of the code expects
+            data = {
+                'rssi': rssi,
+                'rate': rate,
+                'channel': channel,
+                'bandwidth': 0,  # Not provided in CSV format
+                'len': csi_len,
+                'timestamp': timestamp,
+                'magnitude': magnitude,
+                'phase': phase,
+                'csi_data': csi_array,
+                'mac': mac
+            }
+            
+            print(f"[SUCCESS] Parsed CSI packet: RSSI={rssi}dBm, CH={channel}, MAC={mac}, LEN={len(csi_array)} subcarriers")
+            return data
+            
+        except (ValueError, IndexError) as e:
+            print(f"[ERROR] CSV parse failed: {e}")
+            print(f"[ERROR] Attempted to parse: {line[:150]}...")
+            return None
     
     def analyze_csi_structure(self, csi_data):
         """Figure out what CSI data we're getting from the ESP32
@@ -415,8 +434,9 @@ class CSIDataLogger:
         if self.csv_file:
             self.csv_file.close()
 
-# Global logger instance
-logger = None
+# Global logger instances - one for each device
+logger_tx = None  # Transmitter (COM9)
+logger_rx = None  # Receiver (COM10)
 
 @app.route('/')
 def home():
@@ -679,90 +699,166 @@ def home():
             
             <div class="card">
                 <h3>Connection Status</h3>
-                <div class="status" id="status">
-                    <div class="status-item disconnected">Disconnected</div>
-                    <div class="status-item stopped">Not Logging</div>
-                    <div>Packets: <span id="packet-count">0</span></div>
-                    <div>Session: <span id="session-id">None</span></div>
-                </div>
+            <div class="card">
+                <h3>Connection Status</h3>
                 
-                <div style="margin-top: 15px;">
-                    <input type="text" id="port-input" placeholder="COM9 or /dev/ttyUSB0" style="padding: 8px; width: 200px;">
-                    <button class="btn-primary" onclick="connect()">Connect</button>
-                    <button class="btn-danger" onclick="disconnect()">Disconnect</button>
-                    <button class="btn-success" onclick="startLogging()">Start Logging</button>
-                    <button class="btn-warning" onclick="stopLogging()">Stop Logging</button>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px;">
+                    <!-- TRANSMITTER (COM9) STATUS -->
+                    <div>
+                        <h4 style="color: var(--accent-color); margin-bottom: 1em;">📡 TRANSMITTER (COM9)</h4>
+                        <div class="status" id="status-tx">
+                            <div class="status-item disconnected">Disconnected</div>
+                            <div class="status-item stopped">Not Logging</div>
+                            <div>Packets: <span id="packet-count-tx">0</span></div>
+                        </div>
+                        <div style="margin-top: 15px;">
+                            <input type="text" id="port-input-tx" placeholder="COM9" value="COM9" style="padding: 8px; width: 150px;">
+                            <button class="btn-primary" onclick="connectTx()">Connect</button>
+                            <button class="btn-danger" onclick="disconnectTx()">Disconnect</button>
+                        </div>
+                        <div style="margin-top: 10px;">
+                            <button class="btn-success" onclick="startLoggingTx()" style="width: 140px;">Start TX Logging</button>
+                            <button class="btn-warning" onclick="stopLoggingTx()" style="width: 140px;">Stop TX Logging</button>
+                        </div>
+                    </div>
+                    
+                    <!-- RECEIVER (COM10) STATUS -->
+                    <div>
+                        <h4 style="color: #7D8CA3; margin-bottom: 1em;">📡 RECEIVER (COM10)</h4>
+                        <div class="status" id="status-rx">
+                            <div class="status-item disconnected">Disconnected</div>
+                            <div class="status-item stopped">Not Logging</div>
+                            <div>Packets: <span id="packet-count-rx">0</span></div>
+                        </div>
+                        <div style="margin-top: 15px;">
+                            <input type="text" id="port-input-rx" placeholder="COM10" value="COM10" style="padding: 8px; width: 150px;">
+                            <button class="btn-primary" onclick="connectRx()">Connect</button>
+                            <button class="btn-danger" onclick="disconnectRx()">Disconnect</button>
+                        </div>
+                        <div style="margin-top: 10px;">
+                            <button class="btn-success" onclick="startLoggingRx()" style="width: 140px;">Start RX Logging</button>
+                            <button class="btn-warning" onclick="stopLoggingRx()" style="width: 140px;">Stop RX Logging</button>
+                        </div>
+                    </div>
                 </div>
             </div>
             
             <div class="card">
-                <h3>Latest CSI Data</h3>
-                <div class="latest-data" id="latest-data">
-                    <div class="data-item">No data yet...</div>
+                <h3>Latest CSI Data - Comparison</h3>
+                
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px;">
+                    <!-- TRANSMITTER DATA -->
+                    <div>
+                        <h4 style="color: var(--accent-color); margin-bottom: 1em;">📤 Transmitter Signal</h4>
+                        <div class="latest-data" id="latest-data-tx">
+                            <div class="data-item">No data yet...</div>
+                        </div>
+                    </div>
+                    
+                    <!-- RECEIVER DATA -->
+                    <div>
+                        <h4 style="color: #7D8CA3; margin-bottom: 1em;">📥 Receiver Signal</h4>
+                        <div class="latest-data" id="latest-data-rx">
+                            <div class="data-item">No data yet...</div>
+                        </div>
+                    </div>
                 </div>
             </div>
             
             <div class="card">
-                <h3>Real-time Plots</h3>
+                <h3>Real-time RSSI Plots</h3>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px;">
+                    <div class="chart-container">
+                        <h4 style="text-align: center; color: var(--accent-color);">📤 Transmitter RSSI</h4>
+                        <canvas id="rssiChartTx"></canvas>
+                    </div>
+                    <div class="chart-container">
+                        <h4 style="text-align: center; color: #7D8CA3;">📥 Receiver RSSI</h4>
+                        <canvas id="rssiChartRx"></canvas>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>Real-time Subcarrier Plots</h3>
+                <div class="plot-controls" style="margin-bottom: 20px;">
+                    <div class="control-group">
+                        <label>TX Subcarriers:</label>
+                        <select id="tx-subcarrier1" class="subcarrier-select">
+                            <option value="1" selected>Subcarrier 1</option>
+                        </select>
+                        <select id="tx-subcarrier2" class="subcarrier-select">
+                            <option value="5" selected>Subcarrier 5</option>
+                        </select>
+                        <select id="tx-subcarrier3" class="subcarrier-select">
+                            <option value="9" selected>Subcarrier 9</option>
+                        </select>
+                        <select id="tx-subcarrier4" class="subcarrier-select">
+                            <option value="13" selected>Subcarrier 13</option>
+                        </select>
+                        <button class="btn-primary" onclick="updatePlotConfigTx()">Update TX Plots</button>
+                    </div>
+                </div>
                 <div class="plot-controls">
                     <div class="control-group">
-                        <label>Subcarriers:</label>
-                        <select id="subcarrier1" class="subcarrier-select">
-                            <option value="0">Subcarrier 0</option>
+                        <label>RX Subcarriers:</label>
+                        <select id="rx-subcarrier1" class="subcarrier-select">
                             <option value="1" selected>Subcarrier 1</option>
-                            <option value="2">Subcarrier 2</option>
-                            <!-- Add options 3-127 -->
                         </select>
-                        <select id="subcarrier2" class="subcarrier-select">
-                            <option value="0">Subcarrier 0</option>
-                            <option value="1">Subcarrier 1</option>
-                            <option value="2">Subcarrier 2</option>
-                            <!-- Add options 3-127 -->
+                        <select id="rx-subcarrier2" class="subcarrier-select">
+                            <option value="5" selected>Subcarrier 5</option>
                         </select>
-                        <select id="subcarrier3" class="subcarrier-select">
-                            <option value="0">Subcarrier 0</option>
-                            <option value="1">Subcarrier 1</option>
-                            <option value="2">Subcarrier 2</option>
-                            <!-- Add options 3-127 -->
+                        <select id="rx-subcarrier3" class="subcarrier-select">
+                            <option value="9" selected>Subcarrier 9</option>
                         </select>
-                        <select id="subcarrier4" class="subcarrier-select">
-                            <option value="0">Subcarrier 0</option>
-                            <option value="1">Subcarrier 1</option>
-                            <option value="2">Subcarrier 2</option>
-                            <!-- Add options 3-127 -->
+                        <select id="rx-subcarrier4" class="subcarrier-select">
+                            <option value="13" selected>Subcarrier 13</option>
                         </select>
+                        <button class="btn-primary" onclick="updatePlotConfigRx()">Update RX Plots</button>
                     </div>
-                    <button class="btn-primary" onclick="updatePlotConfig()">Update Plots</button>
                 </div>
-                <div class="plots-container">
+                
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px;">
                     <div class="chart-container">
-                        <canvas id="rssiChart"></canvas>
+                        <h4 style="text-align: center; color: var(--accent-color);">📤 Transmitter Subcarriers</h4>
+                        <canvas id="subcarrierChartTx"></canvas>
                     </div>
                     <div class="chart-container">
-                        <canvas id="subcarrierChart"></canvas>
+                        <h4 style="text-align: center; color: #7D8CA3;">📥 Receiver Subcarriers</h4>
+                        <canvas id="subcarrierChartRx"></canvas>
                     </div>
                 </div>
             </div>
             
             <div class="card">
-                <h3>Data Log</h3>
-                <div id="data-log"></div>
+                <h3>Data Logs</h3>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px;">
+                    <div>
+                        <h4 style="color: var(--accent-color); margin-bottom: 1em;">📤 Transmitter Log</h4>
+                        <div id="data-log-tx" style="height: 300px; overflow-y: scroll; border: 1px solid #ddd; padding: 15px; background: var(--light-bg); border-radius: 0; font-family: 'IBM Plex Mono', monospace; font-size: 0.9em;"></div>
+                    </div>
+                    <div>
+                        <h4 style="color: #7D8CA3; margin-bottom: 1em;">📥 Receiver Log</h4>
+                        <div id="data-log-rx" style="height: 300px; overflow-y: scroll; border: 1px solid #ddd; padding: 15px; background: var(--light-bg); border-radius: 0; font-family: 'IBM Plex Mono', monospace; font-size: 0.9em;"></div>
+                    </div>
+                </div>
             </div>
         </div>
         
         <script>
-            let selectedSubcarriers = [1, 5, 9, 13];
+            let selectedSubcarriersTx = [1, 5, 9, 13];
+            let selectedSubcarriersRx = [1, 5, 9, 13];
             
-            // Chart configurations
-            const rssiChart = new Chart(document.getElementById('rssiChart'), {
+            // Chart configurations for TRANSMITTER
+            const rssiChartTx = new Chart(document.getElementById('rssiChartTx'), {
                 type: 'line',
                 data: {
                     labels: [],
                     datasets: [{
-                        label: 'RSSI (dBm)',
+                        label: 'TX RSSI (dBm)',
                         data: [],
-                        borderColor: 'rgb(255, 99, 132)',
-                        backgroundColor: 'rgba(255, 99, 132, 0.2)',
+                        borderColor: 'rgb(121, 169, 209)',
+                        backgroundColor: 'rgba(121, 169, 209, 0.2)',
                         tension: 0.1
                     }]
                 },
@@ -770,154 +866,188 @@ def home():
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: {
-                        title: {
-                            display: true,
-                            text: 'RSSI over Time'
-                        }
+                        title: { display: false }
                     },
                     scales: {
-                        x: {
-                            title: {
-                                display: true,
-                                text: 'Time (seconds ago)'
-                            }
-                        },
                         y: {
-                            title: {
-                                display: true,
-                                text: 'RSSI (dBm)'
-                            }
+                            min: -100,
+                            max: 0
                         }
                     },
-                    animation: {
-                        duration: 0
-                    }
+                    animation: { duration: 0 }
                 }
             });
             
-            const subcarrierChart = new Chart(document.getElementById('subcarrierChart'), {
+            // Chart configurations for RECEIVER
+            const rssiChartRx = new Chart(document.getElementById('rssiChartRx'), {
                 type: 'line',
                 data: {
                     labels: [],
-                    datasets: []
+                    datasets: [{
+                        label: 'RX RSSI (dBm)',
+                        data: [],
+                        borderColor: 'rgb(125, 140, 163)',
+                        backgroundColor: 'rgba(125, 140, 163, 0.2)',
+                        tension: 0.1
+                    }]
                 },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: {
-                        title: {
-                            display: true,
-                            text: 'Subcarrier Values over Time'
-                        }
+                        title: { display: false }
                     },
                     scales: {
-                        x: {
-                            title: {
-                                display: true,
-                                text: 'Time (seconds ago)'
-                            }
-                        },
                         y: {
-                            title: {
-                                display: true,
-                                text: 'Value'
-                            }
+                            min: -100,
+                            max: 0
                         }
                     },
-                    animation: {
-                        duration: 0
-                    }
+                    animation: { duration: 0 }
                 }
             });
             
-            // Initialize subcarrier dropdowns with all 128 options
+            // Subcarrier Charts
+            const subcarrierChartTx = new Chart(document.getElementById('subcarrierChartTx'), {
+                type: 'line',
+                data: { labels: [], datasets: [] },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: { duration: 0 }
+                }
+            });
+            
+            const subcarrierChartRx = new Chart(document.getElementById('subcarrierChartRx'), {
+                type: 'line',
+                data: { labels: [], datasets: [] },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: { duration: 0 }
+                }
+            });
+            
             function initializeSubcarrierDropdowns() {
-                const dropdowns = ['subcarrier1', 'subcarrier2', 'subcarrier3', 'subcarrier4'];
-                dropdowns.forEach((id, index) => {
+                ['tx-subcarrier1', 'tx-subcarrier2', 'tx-subcarrier3', 'tx-subcarrier4', 
+                 'rx-subcarrier1', 'rx-subcarrier2', 'rx-subcarrier3', 'rx-subcarrier4'].forEach(id => {
                     const select = document.getElementById(id);
-                    select.innerHTML = '';
-                    for (let i = 0; i < 128; i++) {
-                        const option = document.createElement('option');
-                        option.value = i;
-                        option.textContent = `Subcarrier ${i}`;
-                        if (i === selectedSubcarriers[index]) {
-                            option.selected = true;
+                    const options = select.innerHTML;
+                    if (!options.includes('Subcarrier 10')) {
+                        select.innerHTML = '';
+                        for (let i = 0; i < 128; i++) {
+                            const option = document.createElement('option');
+                            option.value = i;
+                            option.textContent = `Subcarrier ${i}`;
+                            select.appendChild(option);
                         }
-                        select.appendChild(option);
                     }
                 });
             }
             
-            function updatePlotConfig() {
-                selectedSubcarriers = [
-                    parseInt(document.getElementById('subcarrier1').value),
-                    parseInt(document.getElementById('subcarrier2').value),
-                    parseInt(document.getElementById('subcarrier3').value),
-                    parseInt(document.getElementById('subcarrier4').value)
+            function updatePlotConfigTx() {
+                selectedSubcarriersTx = [
+                    parseInt(document.getElementById('tx-subcarrier1').value),
+                    parseInt(document.getElementById('tx-subcarrier2').value),
+                    parseInt(document.getElementById('tx-subcarrier3').value),
+                    parseInt(document.getElementById('tx-subcarrier4').value)
                 ];
-                
-                // Update chart title
-                subcarrierChart.options.plugins.title.text = 'Subcarrier Values over Time';
-                subcarrierChart.options.scales.y.title.text = 'Value';
-                
-                // Clear existing datasets
-                subcarrierChart.data.datasets = [];
-                
-                // Create new datasets
-                const colors = [
-                    'rgb(54, 162, 235)',
-                    'rgb(255, 205, 86)', 
-                    'rgb(75, 192, 192)',
-                    'rgb(153, 102, 255)'
-                ];
-                
-                selectedSubcarriers.forEach((sc, index) => {
+                subcarrierChartTx.data.datasets = [];
+                const colors = ['rgb(54, 162, 235)', 'rgb(255, 205, 86)', 'rgb(75, 192, 192)', 'rgb(153, 102, 255)'];
+                selectedSubcarriersTx.forEach((sc, index) => {
                     const color = colors[index % colors.length];
-                    subcarrierChart.data.datasets.push({
-                        label: `Subcarrier ${sc}`,
+                    subcarrierChartTx.data.datasets.push({
+                        label: `SC ${sc}`,
                         data: [],
                         borderColor: color,
                         backgroundColor: color.replace('rgb', 'rgba').replace(')', ', 0.2)'),
                         tension: 0.1
                     });
                 });
-                
-                subcarrierChart.update();
+                subcarrierChartTx.update();
+            }
+            
+            function updatePlotConfigRx() {
+                selectedSubcarriersRx = [
+                    parseInt(document.getElementById('rx-subcarrier1').value),
+                    parseInt(document.getElementById('rx-subcarrier2').value),
+                    parseInt(document.getElementById('rx-subcarrier3').value),
+                    parseInt(document.getElementById('rx-subcarrier4').value)
+                ];
+                subcarrierChartRx.data.datasets = [];
+                const colors = ['rgb(54, 162, 235)', 'rgb(255, 205, 86)', 'rgb(75, 192, 192)', 'rgb(153, 102, 255)'];
+                selectedSubcarriersRx.forEach((sc, index) => {
+                    const color = colors[index % colors.length];
+                    subcarrierChartRx.data.datasets.push({
+                        label: `SC ${sc}`,
+                        data: [],
+                        borderColor: color,
+                        backgroundColor: color.replace('rgb', 'rgba').replace(')', ', 0.2)'),
+                        tension: 0.1
+                    });
+                });
+                subcarrierChartRx.update();
             }
             
             function updateCharts() {
-                const params = new URLSearchParams({
-                    subcarriers: selectedSubcarriers.join(',')
+                // Update TX Charts
+                const params_tx = new URLSearchParams({
+                    subcarriers: selectedSubcarriersTx.join(','),
+                    role: 'tx'
                 });
                 
-                fetch('/api/plot_data?' + params)
+                fetch('/api/plot_data?' + params_tx)
                     .then(response => response.json())
                     .then(data => {
                         if (data.time && data.time.length > 0) {
-                            // Update RSSI chart
-                            rssiChart.data.labels = data.time;
-                            rssiChart.data.datasets[0].data = data.rssi;
-                            rssiChart.update('none');
+                            rssiChartTx.data.labels = data.time;
+                            rssiChartTx.data.datasets[0].data = data.rssi;
+                            rssiChartTx.update('none');
                             
-                            // Update subcarrier chart
-                            subcarrierChart.data.labels = data.time;
-                            selectedSubcarriers.forEach((sc, index) => {
+                            subcarrierChartTx.data.labels = data.time;
+                            selectedSubcarriersTx.forEach((sc, index) => {
                                 const key = `subcarrier_${sc}`;
-                                if (subcarrierChart.data.datasets[index] && data.subcarriers[key]) {
-                                    subcarrierChart.data.datasets[index].data = data.subcarriers[key];
+                                if (subcarrierChartTx.data.datasets[index] && data.subcarriers[key]) {
+                                    subcarrierChartTx.data.datasets[index].data = data.subcarriers[key];
                                 }
                             });
-                            subcarrierChart.update('none');
+                            subcarrierChartTx.update('none');
                         }
                     })
-                    .catch(error => console.error('Error updating charts:', error));
-            }
-            
-            function updateStatus() {
-                fetch('/api/status')
+                    .catch(error => console.error('Error updating TX charts:', error));
+                
+                // Update RX Charts
+                const params_rx = new URLSearchParams({
+                    subcarriers: selectedSubcarriersRx.join(','),
+                    role: 'rx'
+                });
+                
+                fetch('/api/plot_data?' + params_rx)
                     .then(response => response.json())
                     .then(data => {
-                        const statusDiv = document.getElementById('status');
+                        if (data.time && data.time.length > 0) {
+                            rssiChartRx.data.labels = data.time;
+                            rssiChartRx.data.datasets[0].data = data.rssi;
+                            rssiChartRx.update('none');
+                            
+                            subcarrierChartRx.data.labels = data.time;
+                            selectedSubcarriersRx.forEach((sc, index) => {
+                                const key = `subcarrier_${sc}`;
+                                if (subcarrierChartRx.data.datasets[index] && data.subcarriers[key]) {
+                                    subcarrierChartRx.data.datasets[index].data = data.subcarriers[key];
+                                }
+                            });
+                            subcarrierChartRx.update('none');
+                        }
+                    })
+                    .catch(error => console.error('Error updating RX charts:', error));
+            }
+            
+            function updateStatusTx() {
+                fetch('/api/status?role=tx')
+                    .then(response => response.json())
+                    .then(data => {
+                        const statusDiv = document.getElementById('status-tx');
                         const connClass = data.connected ? 'connected' : 'disconnected';
                         const connText = data.connected ? 'Connected' : 'Disconnected';
                         const logClass = data.logging ? 'logging' : 'stopped';
@@ -926,8 +1056,25 @@ def home():
                         statusDiv.innerHTML = `
                             <div class="status-item ${connClass}">${connText} ${data.port ? '(' + data.port + ')' : ''}</div>
                             <div class="status-item ${logClass}">${logText}</div>
-                            <div>Packets: <span id="packet-count">${data.packet_count}</span></div>
-                            <div>Session: <span id="session-id">${data.session_id || 'None'}</span></div>
+                            <div>Packets: <span id="packet-count-tx">${data.packet_count}</span></div>
+                        `;
+                    });
+            }
+            
+            function updateStatusRx() {
+                fetch('/api/status?role=rx')
+                    .then(response => response.json())
+                    .then(data => {
+                        const statusDiv = document.getElementById('status-rx');
+                        const connClass = data.connected ? 'connected' : 'disconnected';
+                        const connText = data.connected ? 'Connected' : 'Disconnected';
+                        const logClass = data.logging ? 'logging' : 'stopped';
+                        const logText = data.logging ? 'Logging' : 'Not Logging';
+                        
+                        statusDiv.innerHTML = `
+                            <div class="status-item ${connClass}">${connText} ${data.port ? '(' + data.port + ')' : ''}</div>
+                            <div class="status-item ${logClass}">${logText}</div>
+                            <div>Packets: <span id="packet-count-rx">${data.packet_count}</span></div>
                         `;
                     });
             }
@@ -946,95 +1093,163 @@ def home():
                 }
             }
             
-            function updateLatestData() {
-                fetch('/api/latest')
+            function updateLatestDataTx() {
+                fetch('/api/latest?role=tx')
                     .then(response => response.json())
                     .then(data => {
                         if (Object.keys(data).length > 0) {
-                            const latestDiv = document.getElementById('latest-data');
+                            const latestDiv = document.getElementById('latest-data-tx');
                             latestDiv.innerHTML = `
                                 <div class="data-item"><strong>Packet #:</strong> ${data.packet_num}</div>
                                 <div class="data-item"><strong>RSSI:</strong> ${data.rssi} dBm</div>
                                 <div class="data-item"><strong>Rate:</strong> ${data.rate}</div>
                                 <div class="data-item"><strong>Channel:</strong> ${data.channel}</div>
-                                <div class="data-item"><strong>Bandwidth:</strong> ${data.bandwidth}</div>
-                                <div class="data-item"><strong>Data Length:</strong> ${data.data_length}</div>
-                                <div class="data-item"><strong>Timestamp:</strong> ${data.timestamp ? data.timestamp.split('T')[1].split('.')[0] : 'N/A'}</div>
-                                <div class="data-item"><strong>Time Passed:</strong> ${data.time_passed ? formatTimePassed(data.time_passed) : 'N/A'}</div>
-                                <div class="data-item"><strong>SC1 Value:</strong> ${data.subcarrier_1 ? data.subcarrier_1.toFixed(2) : 'N/A'}</div>
-                                <div class="data-item"><strong>SC5 Value:</strong> ${data.subcarrier_5 ? data.subcarrier_5.toFixed(2) : 'N/A'}</div>
-                                <div class="data-item"><strong>SC9 Value:</strong> ${data.subcarrier_9 ? data.subcarrier_9.toFixed(2) : 'N/A'}</div>
-                                <div class="data-item"><strong>SC13 Value:</strong> ${data.subcarrier_13 ? data.subcarrier_13.toFixed(2) : 'N/A'}</div>
+                                <div class="data-item"><strong>SC1:</strong> ${data.subcarrier_1 ? data.subcarrier_1.toFixed(2) : 'N/A'}</div>
+                                <div class="data-item"><strong>SC5:</strong> ${data.subcarrier_5 ? data.subcarrier_5.toFixed(2) : 'N/A'}</div>
+                                <div class="data-item"><strong>Time:</strong> ${data.time_passed ? formatTimePassed(data.time_passed) : 'N/A'}</div>
                             `;
                         }
                     });
             }
             
-            function updateDataLog() {
-                fetch('/api/recent')
+            function updateLatestDataRx() {
+                fetch('/api/latest?role=rx')
                     .then(response => response.json())
                     .then(data => {
-                        const logDiv = document.getElementById('data-log');
+                        if (Object.keys(data).length > 0) {
+                            const latestDiv = document.getElementById('latest-data-rx');
+                            latestDiv.innerHTML = `
+                                <div class="data-item"><strong>Packet #:</strong> ${data.packet_num}</div>
+                                <div class="data-item"><strong>RSSI:</strong> ${data.rssi} dBm</div>
+                                <div class="data-item"><strong>Rate:</strong> ${data.rate}</div>
+                                <div class="data-item"><strong>Channel:</strong> ${data.channel}</div>
+                                <div class="data-item"><strong>SC1:</strong> ${data.subcarrier_1 ? data.subcarrier_1.toFixed(2) : 'N/A'}</div>
+                                <div class="data-item"><strong>SC5:</strong> ${data.subcarrier_5 ? data.subcarrier_5.toFixed(2) : 'N/A'}</div>
+                                <div class="data-item"><strong>Time:</strong> ${data.time_passed ? formatTimePassed(data.time_passed) : 'N/A'}</div>
+                            `;
+                        }
+                    });
+            }
+            
+            function updateDataLogTx() {
+                fetch('/api/recent?role=tx')
+                    .then(response => response.json())
+                    .then(data => {
+                        const logDiv = document.getElementById('data-log-tx');
                         if (data.length > 0) {
-                            logDiv.innerHTML = data.slice(-15).reverse().map(packet => 
-                                `<div>Packet #${packet.packet_num}: Value=${packet.subcarrier_1 ? packet.subcarrier_1.toFixed(2) : 'N/A'}, Time=${packet.time_passed ? formatTimePassed(packet.time_passed) : 'N/A'} [${packet.timestamp ? packet.timestamp.split('T')[1].split('.')[0] : 'N/A'}]</div>`
+                            logDiv.innerHTML = data.slice(-10).reverse().map(packet => 
+                                `<div>P#${packet.packet_num}: RSSI=${packet.rssi}dBm, SC1=${packet.subcarrier_1 ? packet.subcarrier_1.toFixed(1) : 'N/A'}</div>`
                             ).join('');
                             logDiv.scrollTop = 0;
                         }
                     });
-            
-            // also fetch raw serial lines for debugging
-            fetch('/api/raw')
-                .then(response => response.json())
-                .then(lines => {
-                    if (lines && lines.length) {
-                        console.log('raw lines:', lines.slice(-10));
-                    }
-                });
             }
             
-            function connect() {
-                const port = document.getElementById('port-input').value || 'COM9';
+            function updateDataLogRx() {
+                fetch('/api/recent?role=rx')
+                    .then(response => response.json())
+                    .then(data => {
+                        const logDiv = document.getElementById('data-log-rx');
+                        if (data.length > 0) {
+                            logDiv.innerHTML = data.slice(-10).reverse().map(packet => 
+                                `<div>P#${packet.packet_num}: RSSI=${packet.rssi}dBm, SC1=${packet.subcarrier_1 ? packet.subcarrier_1.toFixed(1) : 'N/A'}</div>`
+                            ).join('');
+                            logDiv.scrollTop = 0;
+                        }
+                    });
+            }
+            
+            function connectTx() {
+                const port = document.getElementById('port-input-tx').value || 'COM9';
                 fetch('/api/connect', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({port: port})
-                }).then(response => response.json())
-                  .then(data => {
-                      console.log('connect response', data);
-                      // Update available subcarriers after connection
-                      setTimeout(initializeSubcarrierDropdowns, 2000);
-                      // refresh status right away
-                      updateStatus();
-                  });
+                    body: JSON.stringify({port: port, role: 'tx'})
+                }).then(() => {
+                    setTimeout(initializeSubcarrierDropdowns, 1000);
+                    updateStatusTx();
+                });
             }
             
-            function disconnect() {
-                fetch('/api/disconnect', {method: 'POST'});
+            function connectRx() {
+                const port = document.getElementById('port-input-rx').value || 'COM10';
+                fetch('/api/connect', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({port: port, role: 'rx'})
+                }).then(() => {
+                    setTimeout(initializeSubcarrierDropdowns, 1000);
+                    updateStatusRx();
+                });
             }
             
-            function startLogging() {
-                fetch('/api/start', {method: 'POST'});
+            function disconnectTx() {
+                fetch('/api/disconnect', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({role: 'tx'})
+                });
             }
             
-            function stopLogging() {
-                fetch('/api/stop', {method: 'POST'});
+            function disconnectRx() {
+                fetch('/api/disconnect', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({role: 'rx'})
+                });
             }
             
-            // Initialize plot configuration and dropdowns
+            function startLoggingTx() {
+                fetch('/api/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({role: 'tx'})
+                });
+            }
+            
+            function startLoggingRx() {
+                fetch('/api/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({role: 'rx'})
+                });
+            }
+            
+            function stopLoggingTx() {
+                fetch('/api/stop', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({role: 'tx'})
+                });
+            }
+            
+            function stopLoggingRx() {
+                fetch('/api/stop', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({role: 'rx'})
+                });
+            }
+            
+            // Initialize
             initializeSubcarrierDropdowns();
-            updatePlotConfig();
+            updatePlotConfigTx();
+            updatePlotConfigRx();
             
             // Update every second
             setInterval(() => {
-                updateStatus();
-                updateLatestData();
-                updateDataLog();
+                updateStatusTx();
+                updateStatusRx();
+                updateLatestDataTx();
+                updateLatestDataRx();
+                updateDataLogTx();
+                updateDataLogRx();
                 updateCharts();
             }, 1000);
             
             // Initial update
-            updateStatus();
+            updateStatusTx();
+            updateStatusRx();
         </script>
     </body>
     </html>
@@ -1044,105 +1259,122 @@ def home():
 
 @app.route('/api/status')
 def api_status():
+    role = request.args.get('role', 'tx')
+    logger = logger_tx if role == 'tx' else logger_rx
     if logger:
         return jsonify(logger.get_status())
     return jsonify({'connected': False, 'logging': False, 'packet_count': 0, 'port': '', 'session_id': None, 'session_dir': None})
 
 @app.route('/api/latest')
 def api_latest():
+    role = request.args.get('role', 'tx')
+    logger = logger_tx if role == 'tx' else logger_rx
     if logger:
         return jsonify(logger.get_latest_packet())
     return jsonify({})
 
 @app.route('/api/recent')
 def api_recent():
+    role = request.args.get('role', 'tx')
+    logger = logger_tx if role == 'tx' else logger_rx
     if logger:
         return jsonify(logger.get_recent_data())
     return jsonify([])
 
 @app.route('/api/subcarriers')
 def api_subcarriers():
+    role = request.args.get('role', 'tx')
+    logger = logger_tx if role == 'tx' else logger_rx
     if logger:
         return jsonify(logger.get_available_subcarriers())
     return jsonify([])
 
 @app.route('/api/plot_data')
 def api_plot_data():
+    role = request.args.get('role', 'tx')
+    logger = logger_tx if role == 'tx' else logger_rx
+    
     if logger:
-        # Get parameters from query string
         subcarriers_param = request.args.get('subcarriers', '1,5,9,13')
         
         try:
             selected_subcarriers = [int(x.strip()) for x in subcarriers_param.split(',') if x.strip()]
-            print(f"Plot data requested for subcarriers: {selected_subcarriers}")  # Debug log
-            
-            # Validate subcarrier indices
             selected_subcarriers = [sc for sc in selected_subcarriers if 0 <= sc < 128]
-            
             if not selected_subcarriers:
-                selected_subcarriers = [1, 5, 9, 13]  # Default fallback
-                
+                selected_subcarriers = [1, 5, 9, 13]
         except ValueError:
-            selected_subcarriers = [1, 5, 9, 13]  # Default fallback
+            selected_subcarriers = [1, 5, 9, 13]
         
         plot_data = logger.get_plot_data(selected_subcarriers)
-        print(f"Returning plot data: {plot_data}")  # Debug log
         return jsonify(plot_data)
     return jsonify({'time': [], 'rssi': [], 'subcarriers': {}})
 
 @app.route('/api/raw')
 def api_raw():
+    role = request.args.get('role', 'tx')
+    logger = logger_tx if role == 'tx' else logger_rx
     if logger:
-        raw_data = logger.get_raw_lines()
-        # Show detailed info about raw lines
-        print(f"[DEBUG] Raw lines count: {len(raw_data)}")
-        if raw_data:
-            print(f"[DEBUG] Last raw line: {raw_data[-1][:200]}")
-        return jsonify(raw_data)
+        return jsonify(logger.get_raw_lines())
     return jsonify([])
 
 @app.route('/api/connect', methods=['POST'])
 def api_connect():
-    global logger
+    global logger_tx, logger_rx
     data = request.get_json()
     port = data.get('port', 'COM9')
+    role = data.get('role', 'tx')
+    
     print(f"\n{'='*60}")
-    print(f"[API] api_connect called with port={port}")
+    print(f"[API] Connect request: port={port}, role={role}")
     print(f"{'='*60}\n")
     
-    # Close existing connection
-    if logger:
-        logger.close()
-        time.sleep(1)  # Give extra time for cleanup
+    # Select the appropriate logger based on role
+    if role == 'tx':
+        if logger_tx:
+            logger_tx.close()
+        logger_tx = CSIDataLogger(port)
+        success = logger_tx.connect()
+        if success:
+            try:
+                logger_tx.start_logging()
+            except Exception as e:
+                print(f"[API] Error starting TX logging: {e}")
+    else:
+        if logger_rx:
+            logger_rx.close()
+        logger_rx = CSIDataLogger(port)
+        success = logger_rx.connect()
+        if success:
+            try:
+                logger_rx.start_logging()
+            except Exception as e:
+                print(f"[API] Error starting RX logging: {e}")
     
-    logger = CSIDataLogger(port)
-    success = logger.connect()
-    print(f"[API] Connected={success}, port={port}")
-    
-    # If connected successfully, start logging immediately
-    started = False
-    if success:
-        try:
-            started = logger.start_logging()
-            print(f"[API] Logging started={started}")
-        except Exception as e:
-            print(f"[API] Error starting logging: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    print(f"[API] Final status: connected={success}, logging={started}\n")
-    return jsonify({'success': success, 'port': port, 'logging': started})
+    return jsonify({'success': success, 'port': port, 'role': role})
 
 @app.route('/api/disconnect', methods=['POST'])
 def api_disconnect():
-    global logger
-    if logger:
-        logger.close()
-        logger = None
+    global logger_tx, logger_rx
+    data = request.get_json()
+    role = data.get('role', 'tx')
+    
+    if role == 'tx':
+        if logger_tx:
+            logger_tx.close()
+            logger_tx = None
+    else:
+        if logger_rx:
+            logger_rx.close()
+            logger_rx = None
+    
     return jsonify({'success': True})
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
+    data = request.get_json()
+    role = data.get('role', 'tx')
+    logger = logger_tx if role == 'tx' else logger_rx
+    
     if logger:
         success = logger.start_logging()
         return jsonify({'success': success})
@@ -1150,6 +1382,10 @@ def api_start():
 
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
+    data = request.get_json()
+    role = data.get('role', 'tx')
+    logger = logger_tx if role == 'tx' else logger_rx
+    
     if logger:
         logger.stop_logging()
         return jsonify({'success': True})
@@ -1159,5 +1395,7 @@ if __name__ == '__main__':
     try:
         app.run(debug=True, host='0.0.0.0', port=5000)
     finally:
-        if logger:
-            logger.close()
+        if logger_tx:
+            logger_tx.close()
+        if logger_rx:
+            logger_rx.close()
