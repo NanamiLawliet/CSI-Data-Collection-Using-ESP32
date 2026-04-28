@@ -11,11 +11,13 @@ from collections import deque
 import math
 import uuid
 
+CSI_REGEX = re.compile(r'CSI_START(\{[^{}]*\})CSI_END')
+ESPNOW_REGEX = re.compile(r'RX,SEQ=(\d+),RAW=(-?\d+),FILT=(-?\d+),RSSI=(-?\d+),TS=(\d+)')
+
 app = Flask(__name__)
 
 class ESPNOWDataLogger:
     def __init__(self, port, baud_rate=115200):
-        # Basic serial connection settings
         self.port = port
         self.baud_rate = baud_rate
         self.serial_conn = None
@@ -24,28 +26,17 @@ class ESPNOWDataLogger:
         self.is_running = False
         self.packet_count = 0
         self.session_start_time = None
-        
-        # Each logging session gets its own directory with a unique ID
-        # This helps keep data organized when doing multiple experiments
         self.session_id = str(uuid.uuid4())[:8]
         self.session_dir = f"sessions/session-{self.session_id}"
         os.makedirs(self.session_dir, exist_ok=True)
-        
-        # Keep track of recent packets for the web display
-        # Using a deque with maxlen=100 means we only keep the last 100 packets
-        # This prevents memory from growing too large during long sessions
+
         self.recent_data = deque(maxlen=100)
         self.latest_packet = {}
-        
-        # Store data points for plotting
-        # We keep 200 points for smooth scrolling plots
         self.plot_data = deque(maxlen=200)
-        
-        # Save raw serial lines for debugging
+        self.available_subcarriers = set()
         self.raw_lines = deque(maxlen=50)
-        
+
     def connect(self):
-        """Try to connect to the ESP32 over serial port"""
         try:
             self.serial_conn = serial.Serial(self.port, self.baud_rate, timeout=1)
             print(f"Connected to ESP32 on {self.port}")
@@ -55,323 +46,230 @@ class ESPNOWDataLogger:
             return False
 
     def setup_csv_file(self):
-        """Create a new CSV file for this logging session"""
         try:
-            # Create filename with timestamp so we know when the data was collected
             timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"csi_data_{timestamp}.csv"
             filepath = os.path.join(self.session_dir, filename)
-            
-            # Ensure directory exists
             os.makedirs(self.session_dir, exist_ok=True)
-            print(f"[CSV] Session directory: {os.path.abspath(self.session_dir)}")
-            
-            self.csv_file = open(filepath, 'w', newline='')
-            print(f"[CSV] File opened: {os.path.abspath(filepath)}")
-            
-            # Define what data we'll store in each row
+            self.csv_file = open(filepath, 'w', newline='', encoding='utf-8')
+
             fieldnames = [
-                'timestamp', 'seq', 'raw_adc', 'filtered_adc', 'rssi', 'esp_timestamp'
+                'timestamp', 'rssi', 'rate', 'channel', 'bandwidth', 'data_length',
+                'esp_timestamp', 'csi_data', 'seq', 'raw_adc', 'filtered_adc'
             ]
-            
+
             self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=fieldnames)
             self.csv_writer.writeheader()
             self.csv_file.flush()
-            
-            print(f"[CSV] CSV writer initialized. File: {filepath}")
-            print(f"[CSV] Headers written: {fieldnames}")
             return filepath
         except Exception as e:
             print(f"[ERROR] Failed to setup CSV file: {e}")
             import traceback
             traceback.print_exc()
             raise
-    
-    def parse_espnow_line(self, line):
-        """Extract ESP-NOW data from the ESP32's output format
-        
-        The ESP32 sends data in this format:
-        RX,SEQ=123,RAW=456,FILT=789,RSSI=-50,TS=123456
-        
-        We need to:
-        1. Parse the comma-separated values
-        2. Return the parsed data as a dictionary or None if something goes wrong
-        """
-        # Pattern to match ESP-NOW output: RX,SEQ=123,RAW=456,FILT=789,RSSI=-50,TS=123456
-        pattern = r'RX,SEQ=(\d+),RAW=(-?\d+),FILT=(-?\d+),RSSI=(-?\d+),TS=(\d+)'
-        
-        match = re.search(pattern, line)
-        if match:
-            try:
-                seq = int(match.group(1))
-                raw_adc = int(match.group(2))
-                filtered_adc = int(match.group(3))
-                rssi = int(match.group(4))
-                esp_timestamp = int(match.group(5))
-                
-                data = {
-                    'seq': seq,
-                    'raw_adc': raw_adc,
-                    'filtered_adc': filtered_adc,
-                    'rssi': rssi,
-                    'esp_timestamp': esp_timestamp
-                }
-                
-                print(f"[SUCCESS] Parsed ESP-NOW packet: SEQ={seq}, RAW={raw_adc}, FILT={filtered_adc}, RSSI={rssi}dBm, TS={esp_timestamp}")
-                return data
-            except ValueError as e:
-                print(f"[ERROR] Failed to parse ESP-NOW values: {e}")
-                print(f"[ERROR] Line: {line}")
-        else:
-            print(f"[WARNING] No ESP-NOW data found in: {line[:100]}...")
-        
-        return None
-    
-    def analyze_csi_structure(self, csi_data):
-        """ESP-NOW doesn't have CSI data, so this is a no-op"""
-        return {}
-    
-    def extract_subcarrier_data(self, csi_data, subcarrier_indices):
-        """ESP-NOW doesn't have subcarrier data"""
-        return {}
-        
-        The ESP32 sends CSI data as an array of integers, where each
-        integer represents the signal strength for that subcarrier.
-        This function extracts just the values we want to plot.
-        """
-        if not csi_data:
-            print("No CSI data provided")
-            return {}
-        
-        result = {}
-        
-        for idx in subcarrier_indices:
-            try:
-                if idx < len(csi_data):
-                    # Get the raw value for this subcarrier
-                    value = csi_data[idx]
-                    result[f'subcarrier_{idx}'] = value
-                else:
-                    print(f"Subcarrier {idx} index out of range (len={len(csi_data)})")
-                    result[f'subcarrier_{idx}'] = 0
-                    
-            except (TypeError, ValueError, IndexError) as e:
-                print(f"Error processing subcarrier {idx}: {e}")
-                result[f'subcarrier_{idx}'] = 0
-        
-        return result
-    
-    def start_logging(self):
-        """Start collecting CSI data in a background thread
-        
-        This function:
-        1. Checks if we're already connected and not already logging
-        2. Creates a new CSV file for this session
-        3. Starts a background thread to read data from the ESP32
-        """
-        if not self.serial_conn:
-            print("Not connected to ESP32")
-            return False
-        
-        if self.is_running:
-            print("Already logging")
-            return False
-            
-        self.is_running = True
-        self.session_start_time = time.time()
-        self.csv_filename = self.setup_csv_file()
-        
-        # Start the logging loop in a separate thread
-        # This keeps the web UI responsive while we collect data
-        self.logging_thread = threading.Thread(target=self._log_loop)
-        self.logging_thread.daemon = True  # Thread will exit when main program exits
-        self.logging_thread.start()
-        
-        return True
-    
-    def _log_loop(self):
-        """Main loop that reads data from the ESP32
-        
-        This function runs in a background thread and:
-        1. Reads data from the serial port
-        2. Parses the CSI data
-        3. Saves it to CSV
-        4. Updates the data structures used by the web UI
-        """
+
+    def parse_csi_line(self, line):
+        match = CSI_REGEX.search(line)
+        if not match:
+            return None
+
         try:
-            print("Starting CSI data collection...")
-            print(f"CSV file: {self.csv_filename}")
-            print(f"CSV writer initialized: {self.csv_writer is not None}")
-            
+            payload = json.loads(match.group(1))
+            return payload
+        except json.JSONDecodeError as exc:
+            print(f"[ERROR] CSI JSON parse failed: {exc} | line={line}")
+            return None
+
+    def parse_espnow_line(self, line):
+        match = ESPNOW_REGEX.search(line)
+        if not match:
+            return None
+
+        try:
+            return {
+                'seq': int(match.group(1)),
+                'raw_adc': int(match.group(2)),
+                'filtered_adc': int(match.group(3)),
+                'rssi': int(match.group(4)),
+                'esp_timestamp': int(match.group(5))
+            }
+        except ValueError as e:
+            print(f"[ERROR] ESP-NOW parse failed: {e} | line={line}")
+            return None
+
+    def _process_packet(self, packet):
+        python_timestamp = datetime.datetime.now().isoformat()
+        csi_data = packet.get('csi_data', [])
+        if isinstance(csi_data, str):
+            try:
+                csi_data = json.loads(csi_data)
+            except Exception:
+                csi_data = []
+
+        data_length = packet.get('data_length', len(csi_data) if isinstance(csi_data, list) else 0)
+        row = {
+            'timestamp': python_timestamp,
+            'rssi': packet.get('rssi', 0),
+            'rate': packet.get('rate', 0),
+            'channel': packet.get('channel', 0),
+            'bandwidth': packet.get('bandwidth', 0),
+            'data_length': data_length,
+            'esp_timestamp': packet.get('esp_timestamp', 0),
+            'csi_data': json.dumps(csi_data) if csi_data else '[]',
+            'seq': packet.get('seq', ''),
+            'raw_adc': packet.get('raw_adc', ''),
+            'filtered_adc': packet.get('filtered_adc', ''),
+        }
+
+        if self.csv_writer:
+            try:
+                self.csv_writer.writerow(row)
+                self.csv_file.flush()
+            except Exception as exc:
+                print(f"[ERROR] Failed to write CSV row: {exc}")
+
+        self.packet_count += 1
+        display_data = {
+            'packet_num': self.packet_count,
+            'timestamp': python_timestamp,
+            'rssi': packet.get('rssi', 0),
+            'rate': packet.get('rate', 0),
+            'channel': packet.get('channel', 0),
+            'bandwidth': packet.get('bandwidth', 0),
+            'data_length': data_length,
+            'esp_timestamp': packet.get('esp_timestamp', 0),
+            'seq': packet.get('seq', 0),
+            'raw_adc': packet.get('raw_adc', 0),
+            'filtered_adc': packet.get('filtered_adc', 0),
+            'time_passed': time.time() - self.session_start_time if self.session_start_time else 0,
+        }
+
+        if isinstance(csi_data, list):
+            for idx, value in enumerate(csi_data):
+                display_data[f'subcarrier_{idx}'] = value
+                self.available_subcarriers.add(idx)
+
+        self.recent_data.append(display_data)
+        self.latest_packet = display_data
+        self.plot_data.append({
+            'time': time.time() - (self.session_start_time or time.time()),
+            'rssi': packet.get('rssi', 0),
+            'raw_adc': packet.get('raw_adc', 0),
+            'filtered_adc': packet.get('filtered_adc', 0),
+            'subcarriers': csi_data if isinstance(csi_data, list) else []
+        })
+
+    def _log_loop(self):
+        try:
             while self.is_running:
                 if self.serial_conn and self.serial_conn.in_waiting > 0:
                     try:
-                        # Read a line from the ESP32
                         line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
-                        # store raw line for debugging
                         if line:
                             self.raw_lines.append(line)
-                        
-                        if line:
-                            # Try to parse the ESP-NOW data
-                            espnow_data = self.parse_espnow_line(line)
-                            
-                            if espnow_data:
-                                try:
-                                    python_timestamp = datetime.datetime.now().isoformat()
-                                    current_time = time.time()
-                                    
-                                    # Prepare the row for the CSV file
-                                    row = {
-                                        'timestamp': python_timestamp,
-                                        'seq': espnow_data.get('seq', ''),
-                                        'raw_adc': espnow_data.get('raw_adc', ''),
-                                        'filtered_adc': espnow_data.get('filtered_adc', ''),
-                                        'rssi': espnow_data.get('rssi', ''),
-                                        'esp_timestamp': espnow_data.get('esp_timestamp', '')
-                                    }
-                                    
-                                    # Save to CSV - with extra error checking
-                                    if self.csv_writer and self.csv_file:
-                                        try:
-                                            self.csv_writer.writerow(row)
-                                            self.csv_file.flush()  # Make sure data is written to disk
-                                            print(f"[CSV] Wrote packet #{self.packet_count + 1} to {self.csv_filename}")
-                                        except Exception as csv_error:
-                                            print(f"[ERROR] Failed to write CSV row: {csv_error}")
-                                    else:
-                                        print(f"[ERROR] CSV writer or file not initialized! Writer={self.csv_writer}, File={self.csv_file}")
-                                    
-                                    # Update the data structures used by the web UI
-                                    self.packet_count += 1
-                                    display_data = {
-                                        'packet_num': self.packet_count,
-                                        'timestamp': python_timestamp,
-                                        'seq': espnow_data.get('seq', 0),
-                                        'raw_adc': espnow_data.get('raw_adc', 0),
-                                        'filtered_adc': espnow_data.get('filtered_adc', 0),
-                                        'rssi': espnow_data.get('rssi', 0),
-                                        'esp_timestamp': espnow_data.get('esp_timestamp', 0),
-                                        'time_passed': current_time - self.session_start_time if self.session_start_time else 0
-                                    }
-                                    
-                                    # Update the data structures for the web UI
-                                    self.recent_data.append(display_data)
-                                    self.latest_packet = display_data
-                                    
-                                    # Store data for plotting
-                                    plot_point = {
-                                        'time': current_time,
-                                        'rssi': csi_data.get('rssi', 0)
-                                    }
-                                    
-                                    # Add all CSI values to the plot data
-                                    for i in range(len(csi_array)):
-                                        plot_point[f'subcarrier_{i}'] = csi_array[i]
-                                    
-                                    self.plot_data.append(plot_point)
-                                    
-                                except Exception as e:
-                                    print(f"[ERROR] Error processing parsed CSI data: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                            
+                            packet = self.parse_csi_line(line)
+                            if packet is None:
+                                packet = self.parse_espnow_line(line)
+
+                            if packet is not None:
+                                self._process_packet(packet)
                             else:
-                                # Print non-CSI output from the ESP32 (connection messages, etc.)
                                 print(f"ESP32: {line}")
                     except Exception as e:
                         print(f"Error processing serial line: {e}")
                         import traceback
                         traceback.print_exc()
-                
-                # Small delay to prevent using too much CPU
                 time.sleep(0.01)
-                
         except Exception as e:
             print(f"Logging error: {e}")
             import traceback
             traceback.print_exc()
         finally:
             self.is_running = False
-    
+
+    def start_logging(self):
+        if not self.serial_conn:
+            print("Not connected to ESP32")
+            return False
+
+        if self.is_running:
+            print("Already logging")
+            return False
+
+        self.is_running = True
+        self.session_start_time = time.time()
+        self.csv_filename = self.setup_csv_file()
+        self.logging_thread = threading.Thread(target=self._log_loop)
+        self.logging_thread.daemon = True
+        self.logging_thread.start()
+        return True
+
     def stop_logging(self):
-        """Stop collecting CSI data and clean up"""
         self.is_running = False
         if hasattr(self, 'logging_thread'):
-            self.logging_thread.join(timeout=1)  # Wait up to 1 second for thread to finish
-    
+            self.logging_thread.join(timeout=1)
+
     def get_status(self):
-        """Get the current status of the logger
-        
-        Returns a dictionary with:
-        - Whether we're connected to the ESP32
-        - Whether we're currently logging
-        - How many packets we've collected
-        - The serial port we're using
-        - The current session ID and directory
-        """
         return {
-            'connected': self.serial_conn and self.serial_conn.is_open,
+            'connected': self.serial_conn is not None and self.serial_conn.is_open,
             'logging': self.is_running,
             'packet_count': self.packet_count,
             'port': self.port,
             'session_id': self.session_id,
             'session_dir': self.session_dir
         }
-    
+
     def get_recent_data(self):
-        """Get the last 100 packets for the web UI's data log"""
         return list(self.recent_data)
-    
+
     def get_latest_packet(self):
-        """Get the most recent packet for the web UI's latest data display"""
         return self.latest_packet
-    
+
     def get_available_subcarriers(self):
-        """ESP-NOW doesn't have subcarriers, return empty list"""
-        return []
-    
+        return sorted(self.available_subcarriers)
+
     def get_raw_lines(self):
-        """Return recent raw lines received from the serial port for debugging"""
         return list(self.raw_lines)
-    
+
     def get_plot_data(self, selected_subcarriers=None):
-        """Return data formatted for plotting ESP-NOW data"""
-        if not self.plot_data:
-            return {'time': [], 'rssi': [], 'raw_adc': [], 'filtered_adc': [], 'seq': []}
-        
-        # Get current time to calculate relative timestamps
-        current_time = time.time()
-        
-        # Convert to relative time (seconds ago) for easier plotting
-        plot_formatted = {
+        if selected_subcarriers is None:
+            selected_subcarriers = [1, 5, 9, 13]
+
+        selected_subcarriers = [int(x) for x in selected_subcarriers if isinstance(x, int) or str(x).isdigit()]
+        selected_subcarriers = sorted(set(selected_subcarriers))
+
+        plot_data = {
             'time': [],
             'rssi': [],
             'raw_adc': [],
             'filtered_adc': [],
-            'seq': []
+            'subcarriers': {}
         }
-        
-        # Only use the last 100 points
-        recent_points = list(self.plot_data)[-100:]
-        
-        for point in recent_points:
-            relative_time = point['time'] - current_time  # This will be negative (seconds ago)
-            plot_formatted['time'].append(relative_time)
-            plot_formatted['rssi'].append(point.get('rssi', 0))
-            plot_formatted['raw_adc'].append(point.get('raw_adc', 0))
-            plot_formatted['filtered_adc'].append(point.get('filtered_adc', 0))
-            plot_formatted['seq'].append(point.get('seq', 0))
-        
-        return plot_formatted
-    
+
+        for idx in selected_subcarriers:
+            plot_data['subcarriers'][f'subcarrier_{idx}'] = []
+
+        for point in list(self.plot_data)[-200:]:
+            plot_data['time'].append(round(point['time'], 3))
+            plot_data['rssi'].append(point.get('rssi', 0))
+            plot_data['raw_adc'].append(point.get('raw_adc', 0))
+            plot_data['filtered_adc'].append(point.get('filtered_adc', 0))
+            for idx in selected_subcarriers:
+                values = point.get('subcarriers', [])
+                if idx < len(values):
+                    plot_data['subcarriers'][f'subcarrier_{idx}'].append(values[idx])
+                else:
+                    plot_data['subcarriers'][f'subcarrier_{idx}'].append(None)
+
+        return plot_data
+
     def close(self):
         self.stop_logging()
         if self.serial_conn and self.serial_conn.is_open:
             self.serial_conn.close()
         if self.csv_file:
             self.csv_file.close()
-
+    
 # Global logger instance
 logger = None
 
@@ -644,16 +542,25 @@ def home():
                 </div>
                 
                 <div style="margin-top: 15px;">
-                    <input type="text" id="port-input" placeholder="COM9 or /dev/ttyUSB0" style="padding: 8px; width: 200px;">
+                    <input type="text" id="port-input" placeholder="COM10 or /dev/ttyUSB0" style="padding: 8px; width: 200px;">
                     <button class="btn-primary" onclick="connect()">Connect</button>
                     <button class="btn-danger" onclick="disconnect()">Disconnect</button>
                     <button class="btn-success" onclick="startLogging()">Start Logging</button>
                     <button class="btn-warning" onclick="stopLogging()">Stop Logging</button>
                 </div>
+                <div class="plot-controls">
+                    <div class="control-group">
+                        <label for="subcarrier-select">Subcarriers</label>
+                        <select id="subcarrier-select" multiple size="4" class="multi-select"></select>
+                    </div>
+                    <div class="control-group">
+                        <button class="btn-primary" onclick="refreshSubcarriers()">Refresh Subcarriers</button>
+                    </div>
+                </div>
             </div>
             
             <div class="card">
-                <h3>Latest ESP-NOW Data</h3>
+                <h3>Latest CSI Data</h3>
                 <div class="latest-data" id="latest-data">
                     <div class="data-item">No data yet...</div>
                 </div>
@@ -782,26 +689,76 @@ def home():
                 adcChart.update();
             }
             
+            function getSelectedSubcarriers() {
+                const select = document.getElementById('subcarrier-select');
+                if (!select) {
+                    return [1, 5, 9, 13];
+                }
+                const selected = Array.from(select.selectedOptions).map(option => parseInt(option.value, 10));
+                return selected.length ? selected : [1, 5, 9, 13];
+            }
+
             function updateCharts() {
-                fetch('/api/plot_data')
+                const selected = getSelectedSubcarriers();
+                fetch('/api/plot_data?subcarriers=' + selected.join(','))
                     .then(response => response.json())
                     .then(data => {
                         if (data.time && data.time.length > 0) {
-                            // Update RSSI chart
                             rssiChart.data.labels = data.time;
                             rssiChart.data.datasets[0].data = data.rssi;
                             rssiChart.update('none');
-                            
-                            // Update ADC chart
+
                             adcChart.data.labels = data.time;
-                            adcChart.data.datasets[0].data = data.raw_adc;
-                            adcChart.data.datasets[1].data = data.filtered_adc;
+                            adcChart.data.datasets = [];
+
+                            adcChart.data.datasets.push({
+                                label: 'RSSI',
+                                data: data.rssi,
+                                borderColor: 'rgb(255, 99, 132)',
+                                backgroundColor: 'rgba(255, 99, 132, 0.2)',
+                                tension: 0.1
+                            });
+
+                            if (data.subcarriers) {
+                                Object.keys(data.subcarriers).forEach((key, index) => {
+                                    const color = ['rgb(54, 162, 235)', 'rgb(75, 192, 192)', 'rgb(255, 206, 86)', 'rgb(153, 102, 255)'][index % 4];
+                                    adcChart.data.datasets.push({
+                                        label: key,
+                                        data: data.subcarriers[key],
+                                        borderColor: color,
+                                        backgroundColor: color.replace('rgb', 'rgba').replace(')', ', 0.2)'),
+                                        tension: 0.1
+                                    });
+                                });
+                            }
+
                             adcChart.update('none');
                         }
                     })
                     .catch(error => console.error('Error updating charts:', error));
             }
-            
+
+            function refreshSubcarriers() {
+                fetch('/api/subcarriers')
+                    .then(response => response.json())
+                    .then(data => {
+                        const select = document.getElementById('subcarrier-select');
+                        if (!select) return;
+                        select.innerHTML = '';
+                        data.slice(0, 16).forEach(index => {
+                            const option = document.createElement('option');
+                            option.value = index;
+                            option.textContent = `Subcarrier ${index}`;
+                            if ([1, 5, 9, 13].includes(index)) {
+                                option.selected = true;
+                            }
+                            select.appendChild(option);
+                        });
+                        updateCharts();
+                    })
+                    .catch(error => console.error('Error loading subcarriers:', error));
+            }
+
             function updateStatus() {
                 fetch('/api/status')
                     .then(response => response.json())
@@ -883,7 +840,7 @@ def home():
             }
             
             function connect() {
-                const port = document.getElementById('port-input').value || 'COM9';
+                const port = document.getElementById('port-input').value || 'COM10';
                 fetch('/api/connect', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -910,6 +867,7 @@ def home():
             
             // Initialize plot configuration
             updatePlotConfig();
+            refreshSubcarriers();
             
             // Update every second
             setInterval(() => {
@@ -955,10 +913,11 @@ def api_subcarriers():
 @app.route('/api/plot_data')
 def api_plot_data():
     if logger:
-        plot_data = logger.get_plot_data()
-        print(f"Returning plot data: {plot_data}")  # Debug log
+        subcarriers = request.args.get('subcarriers', '')
+        selected = [int(x) for x in subcarriers.split(',') if x.strip().isdigit()]
+        plot_data = logger.get_plot_data(selected_subcarriers=selected if selected else None)
         return jsonify(plot_data)
-    return jsonify({'time': [], 'rssi': [], 'raw_adc': [], 'filtered_adc': [], 'seq': []})
+    return jsonify({'time': [], 'rssi': [], 'raw_adc': [], 'filtered_adc': [], 'subcarriers': {}})
 
 @app.route('/api/raw')
 def api_raw():
@@ -975,7 +934,7 @@ def api_raw():
 def api_connect():
     global logger
     data = request.get_json()
-    port = data.get('port', 'COM9')
+    port = data.get('port', 'COM10')
     print(f"\n{'='*60}")
     print(f"[API] api_connect called with port={port}")
     print(f"{'='*60}\n")
