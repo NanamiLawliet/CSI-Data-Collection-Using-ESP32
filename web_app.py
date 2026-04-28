@@ -7,12 +7,14 @@ import csv
 import threading
 import time
 import os
+import atexit
+import signal
 from collections import deque
 import math
 import uuid
 
-CSI_REGEX = re.compile(r'CSI_START(\{[^{}]*\})CSI_END')
-ESPNOW_REGEX = re.compile(r'RX,SEQ=(\d+),RAW=(-?\d+),FILT=(-?\d+),RSSI=(-?\d+),TS=(\d+)')
+CSI_REGEX = re.compile(r'CSI_START(\{.+\})CSI_END')
+ESPNOW_REGEX = re.compile(r'RX,SEQ=(\d+),RSSI=(-?\d+),TS=(\d+)')
 
 app = Flask(__name__)
 
@@ -23,6 +25,7 @@ class ESPNOWDataLogger:
         self.serial_conn = None
         self.csv_writer = None
         self.csv_file = None
+        self.logging_thread = None
         self.is_running = False
         self.packet_count = 0
         self.session_start_time = None
@@ -47,6 +50,7 @@ class ESPNOWDataLogger:
 
     def setup_csv_file(self):
         try:
+            self._close_csv_file()
             timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"csi_data_{timestamp}.csv"
             filepath = os.path.join(self.session_dir, filename)
@@ -68,6 +72,12 @@ class ESPNOWDataLogger:
             traceback.print_exc()
             raise
 
+    def _close_csv_file(self):
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
+        self.csv_writer = None
+
     def parse_csi_line(self, line):
         match = CSI_REGEX.search(line)
         if not match:
@@ -88,10 +98,8 @@ class ESPNOWDataLogger:
         try:
             return {
                 'seq': int(match.group(1)),
-                'raw_adc': int(match.group(2)),
-                'filtered_adc': int(match.group(3)),
-                'rssi': int(match.group(4)),
-                'esp_timestamp': int(match.group(5))
+                'rssi': int(match.group(2)),
+                'esp_timestamp': int(match.group(3))
             }
         except ValueError as e:
             print(f"[ERROR] ESP-NOW parse failed: {e} | line={line}")
@@ -117,8 +125,6 @@ class ESPNOWDataLogger:
             'esp_timestamp': packet.get('esp_timestamp', 0),
             'csi_data': json.dumps(csi_data) if csi_data else '[]',
             'seq': packet.get('seq', ''),
-            'raw_adc': packet.get('raw_adc', ''),
-            'filtered_adc': packet.get('filtered_adc', ''),
         }
 
         if self.csv_writer:
@@ -139,8 +145,6 @@ class ESPNOWDataLogger:
             'data_length': data_length,
             'esp_timestamp': packet.get('esp_timestamp', 0),
             'seq': packet.get('seq', 0),
-            'raw_adc': packet.get('raw_adc', 0),
-            'filtered_adc': packet.get('filtered_adc', 0),
             'time_passed': time.time() - self.session_start_time if self.session_start_time else 0,
         }
 
@@ -154,8 +158,6 @@ class ESPNOWDataLogger:
         self.plot_data.append({
             'time': time.time() - (self.session_start_time or time.time()),
             'rssi': packet.get('rssi', 0),
-            'raw_adc': packet.get('raw_adc', 0),
-            'filtered_adc': packet.get('filtered_adc', 0),
             'subcarriers': csi_data if isinstance(csi_data, list) else []
         })
 
@@ -206,8 +208,10 @@ class ESPNOWDataLogger:
 
     def stop_logging(self):
         self.is_running = False
-        if hasattr(self, 'logging_thread'):
+        if self.logging_thread is not None:
             self.logging_thread.join(timeout=1)
+            self.logging_thread = None
+        self._close_csv_file()
 
     def get_status(self):
         return {
@@ -241,8 +245,6 @@ class ESPNOWDataLogger:
         plot_data = {
             'time': [],
             'rssi': [],
-            'raw_adc': [],
-            'filtered_adc': [],
             'subcarriers': {}
         }
 
@@ -252,8 +254,6 @@ class ESPNOWDataLogger:
         for point in list(self.plot_data)[-200:]:
             plot_data['time'].append(round(point['time'], 3))
             plot_data['rssi'].append(point.get('rssi', 0))
-            plot_data['raw_adc'].append(point.get('raw_adc', 0))
-            plot_data['filtered_adc'].append(point.get('filtered_adc', 0))
             for idx in selected_subcarriers:
                 values = point.get('subcarriers', [])
                 if idx < len(values):
@@ -267,11 +267,27 @@ class ESPNOWDataLogger:
         self.stop_logging()
         if self.serial_conn and self.serial_conn.is_open:
             self.serial_conn.close()
-        if self.csv_file:
-            self.csv_file.close()
+        self.serial_conn = None
     
 # Global logger instance
 logger = None
+
+
+def cleanup_logger():
+    global logger
+    if logger:
+        logger.close()
+        logger = None
+
+
+def _handle_shutdown(signum, frame):
+    cleanup_logger()
+    raise SystemExit(0)
+
+
+atexit.register(cleanup_logger)
+signal.signal(signal.SIGINT, _handle_shutdown)
+signal.signal(signal.SIGTERM, _handle_shutdown)
 
 @app.route('/')
 def home():
@@ -573,7 +589,7 @@ def home():
                         <canvas id="rssiChart"></canvas>
                     </div>
                     <div class="chart-container">
-                        <canvas id="adcChart"></canvas>
+                        <canvas id="csiChart"></canvas>
                     </div>
                 </div>
             </div>
@@ -627,7 +643,7 @@ def home():
                 }
             });
             
-            const adcChart = new Chart(document.getElementById('adcChart'), {
+            const csiChart = new Chart(document.getElementById('csiChart'), {
                 type: 'line',
                 data: {
                     labels: [],
@@ -639,7 +655,7 @@ def home():
                     plugins: {
                         title: {
                             display: true,
-                            text: 'ADC Values over Time'
+                            text: 'CSI Values over Time'
                         }
                     },
                     scales: {
@@ -652,7 +668,7 @@ def home():
                         y: {
                             title: {
                                 display: true,
-                                text: 'ADC Value'
+                                text: 'CSI Value'
                             }
                         }
                     },
@@ -664,20 +680,20 @@ def home():
             
             function updatePlotConfig() {
                 // Update chart title
-                adcChart.options.plugins.title.text = 'ADC Values over Time';
-                adcChart.options.scales.y.title.text = 'ADC Value';
+                csiChart.options.plugins.title.text = 'CSI Values over Time';
+                csiChart.options.scales.y.title.text = 'CSI Value';
                 
                 // Clear existing datasets
-                adcChart.data.datasets = [];
+                csiChart.data.datasets = [];
                 
-                // Create ADC datasets
-                const adcDatasets = [
-                    { label: 'Raw ADC', key: 'raw_adc', color: 'rgb(54, 162, 235)' },
-                    { label: 'Filtered ADC', key: 'filtered_adc', color: 'rgb(255, 99, 132)' }
+                // Create CSI datasets
+                const csiDatasets = [
+                    { label: 'Raw CSI', key: 'raw_csi', color: 'rgb(54, 162, 235)' },
+                    { label: 'Filtered CSI', key: 'filtered_csi', color: 'rgb(255, 99, 132)' }
                 ];
                 
-                adcDatasets.forEach(dataset => {
-                    adcChart.data.datasets.push({
+                csiDatasets.forEach(dataset => {
+                    csiChart.data.datasets.push({
                         label: dataset.label,
                         data: [],
                         borderColor: dataset.color,
@@ -686,7 +702,7 @@ def home():
                     });
                 });
                 
-                adcChart.update();
+                csiChart.update();
             }
             
             function getSelectedSubcarriers() {
@@ -708,10 +724,10 @@ def home():
                             rssiChart.data.datasets[0].data = data.rssi;
                             rssiChart.update('none');
 
-                            adcChart.data.labels = data.time;
-                            adcChart.data.datasets = [];
+                            csiChart.data.labels = data.time;
+                            csiChart.data.datasets = [];
 
-                            adcChart.data.datasets.push({
+                            csiChart.data.datasets.push({
                                 label: 'RSSI',
                                 data: data.rssi,
                                 borderColor: 'rgb(255, 99, 132)',
@@ -722,7 +738,7 @@ def home():
                             if (data.subcarriers) {
                                 Object.keys(data.subcarriers).forEach((key, index) => {
                                     const color = ['rgb(54, 162, 235)', 'rgb(75, 192, 192)', 'rgb(255, 206, 86)', 'rgb(153, 102, 255)'][index % 4];
-                                    adcChart.data.datasets.push({
+                                    csiChart.data.datasets.push({
                                         label: key,
                                         data: data.subcarriers[key],
                                         borderColor: color,
@@ -732,7 +748,7 @@ def home():
                                 });
                             }
 
-                            adcChart.update('none');
+                            csiChart.update('none');
                         }
                     })
                     .catch(error => console.error('Error updating charts:', error));
@@ -941,7 +957,7 @@ def api_connect():
     
     # Close existing connection
     if logger:
-        logger.close()
+        cleanup_logger()
         time.sleep(1)  # Give extra time for cleanup
     
     logger = ESPNOWDataLogger(port)
@@ -965,9 +981,18 @@ def api_connect():
 @app.route('/api/disconnect', methods=['POST'])
 def api_disconnect():
     global logger
-    if logger:
-        logger.close()
-        logger = None
+    cleanup_logger()
+    return jsonify({'success': True})
+
+
+@app.route('/api/shutdown', methods=['POST'])
+def api_shutdown():
+    cleanup_logger()
+    shutdown_func = request.environ.get('werkzeug.server.shutdown')
+    if shutdown_func is None:
+        return jsonify({'success': False, 'error': 'Server shutdown is not available'})
+
+    shutdown_func()
     return jsonify({'success': True})
 
 @app.route('/api/start', methods=['POST'])
@@ -986,7 +1011,6 @@ def api_stop():
 
 if __name__ == '__main__':
     try:
-        app.run(debug=True, host='0.0.0.0', port=5000)
+        app.run(debug=True, use_reloader=False, host='0.0.0.0', port=5000)
     finally:
-        if logger:
-            logger.close()
+        cleanup_logger()

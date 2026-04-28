@@ -13,12 +13,14 @@
 
 // Sonradan kolayca değiştirilebilir: sadece aşağıdaki satırı değiştirin.
 #define ESP_NOW_ROLE_SLAVE
-// #define ESP_NOW_ROLE_SLAVE
+// #define ESP_NOW_ROLE_MASTER
 
 #define ESPNOW_CHANNEL 1
 #define ESPNOW_TX_POWER_DBM 78
 #define SEND_INTERVAL_MS 100
 #define CSI_MAX_DATA_LEN 256
+#define CSI_LOG_BUFFER_LEN 2048
+#define SENSOR_PAYLOAD_HEADER_LEN (sizeof(uint32_t) + sizeof(uint32_t))
 
 #ifdef ESP_NOW_ROLE_MASTER
 static const uint8_t receiver_mac[ESP_NOW_ETH_ALEN] = {0x08, 0xd1, 0xf9, 0xf6, 0x7c, 0xec};
@@ -30,6 +32,18 @@ static QueueHandle_t csi_queue = NULL;
 #endif
 
 static const char *TAG = "ESP_NOW";
+
+static esp_err_t configure_espnow_peer_rate(const uint8_t *peer_mac)
+{
+    esp_now_rate_config_t rate_config = {
+        .phymode = WIFI_PHY_MODE_HT20,
+        .rate = WIFI_PHY_RATE_MCS0_LGI,
+        .ersu = false,
+        .dcm = false,
+    };
+
+    return esp_now_set_peer_rate_config(peer_mac, &rate_config);
+}
 
 typedef struct {
     uint32_t seq;
@@ -94,6 +108,7 @@ static esp_err_t init_espnow(void)
     peer.encrypt = false;
 
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+    ESP_ERROR_CHECK(configure_espnow_peer_rate(receiver_mac));
     return ESP_OK;
 }
 
@@ -129,18 +144,17 @@ void app_main(void)
 
 static void espnow_recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int len)
 {
-    if (data == NULL || len != sizeof(sensor_payload_t)) {
-        ESP_LOGW(TAG, "Gelen veri beklenmeyen boyutta: %d", len);
+    if (data == NULL || len < SENSOR_PAYLOAD_HEADER_LEN) {
+        ESP_LOGW(TAG, "Gelen veri gecersiz veya cok kisa: %d", len);
         return;
+    }
+
+    if (len != sizeof(sensor_payload_t)) {
+        ESP_LOGW(TAG, "Gelen veri beklenmeyen boyutta: %d (beklenen: %u)", len, (unsigned)sizeof(sensor_payload_t));
     }
 
     const sensor_payload_t *payload = (const sensor_payload_t *)data;
     int rssi = esp_now_info && esp_now_info->rx_ctrl ? esp_now_info->rx_ctrl->rssi : 0;
-
-    printf("RX,SEQ=%" PRIu32 ",RSSI=%d,TS=%" PRIu32 "\n",
-           payload->seq,
-           rssi,
-           payload->timestamp_ms);
 
     ESP_LOGI(TAG, "Gelen paket: seq=%" PRIu32 " rssi=%d",
              payload->seq,
@@ -183,6 +197,7 @@ static esp_err_t init_espnow(void)
     peer.ifidx = ESP_IF_WIFI_STA;
     peer.encrypt = false;
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+    ESP_ERROR_CHECK(configure_espnow_peer_rate(sender_mac));
 
     return ESP_OK;
 }
@@ -222,22 +237,31 @@ static void csi_processing_task(void *pvParameter)
 {
     csi_event_t event;
     while (xQueueReceive(csi_queue, &event, portMAX_DELAY) == pdTRUE) {
-        printf("CSI_START{\"rssi\":%d,\"rate\":%d,\"channel\":%d,\"bandwidth\":%d,\"data_length\":%d,\"esp_timestamp\":%lld,\"csi_data\":[",
-               event.rssi,
-               event.rate,
-               event.channel,
-               event.bandwidth,
-               event.data_length,
-               event.esp_timestamp);
-
+        char csi_log[CSI_LOG_BUFFER_LEN];
+        int written = snprintf(csi_log,
+                               sizeof(csi_log),
+                               "CSI_START{\"rssi\":%" PRId32 ",\"rate\":%" PRId32 ",\"channel\":%" PRId32 ",\"bandwidth\":%" PRId32 ",\"data_length\":%" PRId32 ",\"esp_timestamp\":%" PRId64 ",\"csi_data\":[",
+                               event.rssi,
+                               event.rate,
+                               event.channel,
+                               event.bandwidth,
+                               event.data_length,
+                               event.esp_timestamp);
         for (int i = 0; i < event.data_length; i++) {
-            printf("%d", event.csi_data[i]);
-            if (i + 1 < event.data_length) {
-                printf(",");
+            if (written < 0 || written >= (int)sizeof(csi_log)) {
+                break;
             }
+
+            written += snprintf(csi_log + written,
+                                sizeof(csi_log) - written,
+                                (i + 1 < event.data_length) ? "%d," : "%d",
+                                event.csi_data[i]);
         }
 
-        printf("]}CSI_END\n");
+        if (written >= 0 && written < (int)sizeof(csi_log)) {
+            snprintf(csi_log + written, sizeof(csi_log) - written, "]}CSI_END\n");
+            printf("%s", csi_log);
+        }
     }
 }
 
@@ -250,9 +274,10 @@ static esp_err_t init_csi(void)
         .ltf_merge_en = true,
     };
 
-    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_cfg));
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_cb, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
 
     return ESP_OK;
 }
@@ -268,8 +293,8 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(init_wifi());
-    ESP_ERROR_CHECK(init_espnow());
     ESP_ERROR_CHECK(init_csi());
+    ESP_ERROR_CHECK(init_espnow());
 
     xTaskCreate(csi_processing_task, "csi_processing_task", 4096, NULL, 5, NULL);
 
