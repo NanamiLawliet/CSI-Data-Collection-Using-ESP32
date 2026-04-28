@@ -45,7 +45,7 @@ class ESPNOWDataLogger:
         self.raw_lines = deque(maxlen=50)
         
     def connect(self):
-        """Try to connect to the ESP32 over serial port"""
+        
         try:
             self.serial_conn = serial.Serial(self.port, self.baud_rate, timeout=1)
             print(f"Connected to ESP32 on {self.port}")
@@ -55,7 +55,7 @@ class ESPNOWDataLogger:
             return False
 
     def setup_csv_file(self):
-        """Create a new CSV file for this logging session"""
+        
         try:
             # Create filename with timestamp so we know when the data was collected
             timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -71,7 +71,7 @@ class ESPNOWDataLogger:
             
             # Define what data we'll store in each row
             fieldnames = [
-                'timestamp', 'rssi', 'rate', 'channel', 'bandwidth', 'data_length', 'esp_timestamp', 'csi_data'
+                'timestamp', 'seq', 'raw_adc', 'filtered_adc', 'rssi', 'esp_timestamp'
             ]
             
             self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=fieldnames)
@@ -87,274 +87,60 @@ class ESPNOWDataLogger:
             traceback.print_exc()
             raise
     
-    def parse_csi_line(self, line):
-        """Extract CSI data from the ESP32's output format
+    def parse_espnow_line(self, line):
         
-        The ESP32 sends CSI data in this format:
-        CSI,RSSI=-50,RATE=1,CHAN=1,BW=20,LEN=128,TS=123456,DATA=1,2,3,4,...
-        
-        We need to:
-        1. Parse the comma-separated values
-        2. Extract CSI data array
-        3. Return the parsed data as a dictionary or None if something goes wrong
-        """
-        # Pattern to match CSI output: CSI,RSSI=-50,RATE=1,CHAN=1,BW=20,LEN=128,TS=123456,DATA=1,2,3,...
-        pattern = r'CSI,RSSI=(-?\d+),RATE=(\d+),CHAN=(\d+),BW=(\d+),LEN=(\d+),TS=(\d+),DATA=(.+)'
+        # Pattern to match ESP-NOW output: RX,SEQ=123,RAW=456,FILT=789,RSSI=-50,TS=123456
+        pattern = r'RX,SEQ=(\d+),RAW=(-?\d+),FILT=(-?\d+),RSSI=(-?\d+),TS=(\d+)'
         
         match = re.search(pattern, line)
         if match:
             try:
-                rssi = int(match.group(1))
-                rate = int(match.group(2))
-                channel = int(match.group(3))
-                bandwidth = int(match.group(4))
-                data_length = int(match.group(5))
-                esp_timestamp = int(match.group(6))
-                csi_data_str = match.group(7)
-                
-                # Parse CSI data array
-                csi_array = []
-                if csi_data_str:
-                    csi_values = csi_data_str.split(',')
-                    for val in csi_values:
-                        try:
-                            csi_array.append(int(val.strip()))
-                        except ValueError:
-                            continue
+                seq = int(match.group(1))
+                raw_adc = int(match.group(2))
+                filtered_adc = int(match.group(3))
+                rssi = int(match.group(4))
+                esp_timestamp = int(match.group(5))
                 
                 data = {
+                    'seq': seq,
+                    'raw_adc': raw_adc,
+                    'filtered_adc': filtered_adc,
                     'rssi': rssi,
-                    'rate': rate,
-                    'channel': channel,
-                    'bandwidth': bandwidth,
-                    'data_length': data_length,
-                    'esp_timestamp': esp_timestamp,
-                    'csi_data': csi_array
+                    'esp_timestamp': esp_timestamp
                 }
                 
-                print(f"[SUCCESS] Parsed CSI packet: RSSI={rssi}dBm, Rate={rate}, Chan={channel}, Len={data_length}")
+                print(f"[SUCCESS] Parsed ESP-NOW packet: SEQ={seq}, RAW={raw_adc}, FILT={filtered_adc}, RSSI={rssi}dBm, TS={esp_timestamp}")
                 return data
             except ValueError as e:
-                print(f"[ERROR] Failed to parse CSI values: {e}")
+                print(f"[ERROR] Failed to parse ESP-NOW values: {e}")
                 print(f"[ERROR] Line: {line}")
         else:
-            print(f"[WARNING] No CSI data found in: {line[:100]}...")
+            print(f"[WARNING] No ESP-NOW data found in: {line[:100]}...")
         
         return None
     
     def analyze_csi_structure(self, csi_data):
-        """ESP-NOW doesn't have CSI data, so this is a no-op"""
+        
         return {}
     
     def extract_subcarrier_data(self, csi_data, subcarrier_indices):
-        """ESP-NOW doesn't have subcarrier data"""
+        
         return {}
-    
-    def analyze_csi_structure(self, csi_data):
-        """
+        
         The ESP32 sends CSI data as an array of integers, where each
         integer represents the signal strength for that subcarrier.
         This function extracts just the values we want to plot.
-        """
-        if not csi_data:
-            print("No CSI data provided")
-            return {}
-        
-        result = {}
-        
-        for idx in subcarrier_indices:
-            try:
-                if idx < len(csi_data):
-                    # Get the raw value for this subcarrier
-                    value = csi_data[idx]
-                    result[f'subcarrier_{idx}'] = value
-                else:
-                    print(f"Subcarrier {idx} index out of range (len={len(csi_data)})")
-                    result[f'subcarrier_{idx}'] = 0
-                    
-            except (TypeError, ValueError, IndexError) as e:
-                print(f"Error processing subcarrier {idx}: {e}")
-                result[f'subcarrier_{idx}'] = 0
-        
-        return result
-    
-    def start_logging(self):
-        """Start collecting CSI data in a background thread
-        
-        This function:
-        1. Checks if we're already connected and not already logging
-        2. Creates a new CSV file for this session
-        3. Starts a background thread to read data from the ESP32
-        """
-        if not self.serial_conn:
-            print("Not connected to ESP32")
-            return False
-        
-        if self.is_running:
-            print("Already logging")
-            return False
-            
-        self.is_running = True
-        self.session_start_time = time.time()
-        self.csv_filename = self.setup_csv_file()
-        
-        # Start the logging loop in a separate thread
-        # This keeps the web UI responsive while we collect data
-        self.logging_thread = threading.Thread(target=self._log_loop)
-        self.logging_thread.daemon = True  # Thread will exit when main program exits
-        self.logging_thread.start()
-        
-        return True
-    
-    def _log_loop(self):
-        """Main loop that reads data from the ESP32
+        Main loop that reads data from the ESP32
         
         This function runs in a background thread and:
         1. Reads data from the serial port
         2. Parses the CSI data
         3. Saves it to CSV
         4. Updates the data structures used by the web UI
-        """
-        try:
-            print("Starting CSI data collection...")
-            print(f"CSV file: {self.csv_filename}")
-            print(f"CSV writer initialized: {self.csv_writer is not None}")
-            
-            while self.is_running:
-                if self.serial_conn and self.serial_conn.in_waiting > 0:
-                    try:
-                        # Read a line from the ESP32
-                        line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
-                        # store raw line for debugging
-                        if line:
-                            self.raw_lines.append(line)
-                        
-                        if line:
-                            # Try to parse the CSI data
-                            csi_data = self.parse_csi_line(line)
-                            
-                            if csi_data:
-                                try:
-                                    python_timestamp = datetime.datetime.now().isoformat()
-                                    
-                                    # Prepare the row for the CSV file
-                                    row = {
-                                        'timestamp': python_timestamp,
-                                        'rssi': csi_data.get('rssi', ''),
-                                        'rate': csi_data.get('rate', ''),
-                                        'channel': csi_data.get('channel', ''),
-                                        'bandwidth': csi_data.get('bandwidth', ''),
-                                        'data_length': csi_data.get('data_length', ''),
-                                        'esp_timestamp': csi_data.get('esp_timestamp', ''),
-                                        'csi_data': ','.join(map(str, csi_data.get('csi_data', [])))
-                                    }
-                                    
-                                    # Save to CSV - with extra error checking
-                                    if self.csv_writer and self.csv_file:
-                                        try:
-                                            self.csv_writer.writerow(row)
-                                            self.csv_file.flush()  # Make sure data is written to disk
-                                            print(f"[CSV] Wrote packet #{self.packet_count + 1} to {self.csv_filename}")
-                                        except Exception as csv_error:
-                                            print(f"[ERROR] Failed to write CSV row: {csv_error}")
-                                    else:
-                                        print(f"[ERROR] CSV writer or file not initialized! Writer={self.csv_writer}, File={self.csv_file}")
-                                    
-                                    # Update the data structures used by the web UI
-                                    self.packet_count += 1
-                                    display_data = {
-                                        'packet_num': self.packet_count,
-                                        'timestamp': python_timestamp,
-                                        'seq': espnow_data.get('seq', 0),
-                                        'raw_adc': espnow_data.get('raw_adc', 0),
-                                        'filtered_adc': espnow_data.get('filtered_adc', 0),
-                                        'rssi': espnow_data.get('rssi', 0),
-                                        'esp_timestamp': espnow_data.get('esp_timestamp', 0),
-                                        'time_passed': current_time - self.session_start_time if self.session_start_time else 0
-                                    }
-                                    
-                                    # Update the data structures for the web UI
-                                    self.recent_data.append(display_data)
-                                    self.latest_packet = display_data
-                                    
-                                    # Store data for plotting
-                                    plot_point = {
-                                        'time': current_time,
-                                        'rssi': csi_data.get('rssi', 0)
-                                    }
-                                    
-                                    # Add all CSI values to the plot data
-                                    for i in range(len(csi_array)):
-                                        plot_point[f'subcarrier_{i}'] = csi_array[i]
-                                    
-                                    self.plot_data.append(plot_point)
-                                    
-                                except Exception as e:
-                                    print(f"[ERROR] Error processing parsed CSI data: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                            
-                            else:
-                                # Print non-CSI output from the ESP32 (connection messages, etc.)
-                                print(f"ESP32: {line}")
-                    except Exception as e:
-                        print(f"Error processing serial line: {e}")
-                        import traceback
-                        traceback.print_exc()
-                
-                # Small delay to prevent using too much CPU
-                time.sleep(0.01)
-                
-        except Exception as e:
-            print(f"Logging error: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.is_running = False
-    
-    def stop_logging(self):
-        """Stop collecting CSI data and clean up"""
-        self.is_running = False
-        if hasattr(self, 'logging_thread'):
-            self.logging_thread.join(timeout=1)  # Wait up to 1 second for thread to finish
-    
-    def get_status(self):
-        """Get the current status of the logger
+        Stop collecting CSI data and clean upGet the current status of the logger
         
-        Returns a dictionary with:
-        - Whether we're connected to the ESP32
-        - Whether we're currently logging
-        - How many packets we've collected
-        - The serial port we're using
-        - The current session ID and directory
-        """
-        return {
-            'connected': self.serial_conn and self.serial_conn.is_open,
-            'logging': self.is_running,
-            'packet_count': self.packet_count,
-            'port': self.port,
-            'session_id': self.session_id,
-            'session_dir': self.session_dir
-        }
-    
-    def get_recent_data(self):
-        """Get the last 100 packets for the web UI's data log"""
-        return list(self.recent_data)
-    
-    def get_latest_packet(self):
-        """Get the most recent packet for the web UI's latest data display"""
-        return self.latest_packet
-    
-    def get_available_subcarriers(self):
-        """ESP-NOW doesn't have subcarriers, return empty list"""
-        return []
-    
-    def get_raw_lines(self):
-        """Return recent raw lines received from the serial port for debugging"""
-        return list(self.raw_lines)
-    
-    def get_plot_data(self, selected_subcarriers=None):
-        """Return data formatted for plotting ESP-NOW data"""
+        Returns a dictionary with status information
+        Get the last 100 packets for the web UI's data logGet the most recent packet for the web UI's latest data displayESP-NOW doesn't have subcarriers, return empty listReturn recent raw lines received from the serial port for debuggingReturn data formatted for plotting ESP-NOW data"""
         if not self.plot_data:
             return {'time': [], 'rssi': [], 'raw_adc': [], 'filtered_adc': [], 'seq': []}
         
@@ -399,7 +185,7 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>ESP32 CSI Data Monitor</title>
+        <title>ESP32 CSI Data Monitor with Configurable Plots</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
@@ -684,7 +470,7 @@ def home():
                         <canvas id="rssiChart"></canvas>
                     </div>
                     <div class="chart-container">
-                        <canvas id="subcarrierChart"></canvas>
+                        <canvas id="adcChart"></canvas>
                     </div>
                 </div>
             </div>
@@ -738,7 +524,7 @@ def home():
                 }
             });
             
-            const subcarrierChart = new Chart(document.getElementById('subcarrierChart'), {
+            const adcChart = new Chart(document.getElementById('adcChart'), {
                 type: 'line',
                 data: {
                     labels: [],
@@ -775,32 +561,29 @@ def home():
             
             function updatePlotConfig() {
                 // Update chart title
-                subcarrierChart.options.plugins.title.text = 'CSI Subcarrier Values over Time';
-                subcarrierChart.options.scales.y.title.text = 'CSI Value';
+                adcChart.options.plugins.title.text = 'ADC Values over Time';
+                adcChart.options.scales.y.title.text = 'ADC Value';
                 
                 // Clear existing datasets
-                subcarrierChart.data.datasets = [];
+                adcChart.data.datasets = [];
                 
-                // Create subcarrier datasets (show first 10 subcarriers)
-                const numSubcarriers = 10;
-                const colors = [
-                    'rgb(54, 162, 235)', 'rgb(255, 205, 86)', 'rgb(75, 192, 192)',
-                    'rgb(153, 102, 255)', 'rgb(255, 99, 132)', 'rgb(255, 159, 64)',
-                    'rgb(199, 199, 199)', 'rgb(83, 102, 255)', 'rgb(255, 99, 255)',
-                    'rgb(99, 255, 132)'
+                // Create ADC datasets
+                const adcDatasets = [
+                    { label: 'Raw ADC', key: 'raw_adc', color: 'rgb(54, 162, 235)' },
+                    { label: 'Filtered ADC', key: 'filtered_adc', color: 'rgb(255, 99, 132)' }
                 ];
                 
-                for (let i = 0; i < numSubcarriers; i++) {
-                    subcarrierChart.data.datasets.push({
-                        label: `Subcarrier ${i}`,
+                adcDatasets.forEach(dataset => {
+                    adcChart.data.datasets.push({
+                        label: dataset.label,
                         data: [],
-                        borderColor: colors[i % colors.length],
-                        backgroundColor: colors[i % colors.length].replace('rgb', 'rgba').replace(')', ', 0.2)'),
+                        borderColor: dataset.color,
+                        backgroundColor: dataset.color.replace('rgb', 'rgba').replace(')', ', 0.2)'),
                         tension: 0.1
                     });
-                }
+                });
                 
-                subcarrierChart.update();
+                adcChart.update();
             }
             
             function updateCharts() {
@@ -813,16 +596,11 @@ def home():
                             rssiChart.data.datasets[0].data = data.rssi;
                             rssiChart.update('none');
                             
-                            // Update subcarrier chart
-                            subcarrierChart.data.labels = data.time;
-                            // Update first 10 subcarriers
-                            for (let i = 0; i < Math.min(10, subcarrierChart.data.datasets.length); i++) {
-                                const key = `subcarrier_${i}`;
-                                if (data.subcarriers && data.subcarriers[key]) {
-                                    subcarrierChart.data.datasets[i].data = data.subcarriers[key];
-                                }
-                            }
-                            subcarrierChart.update('none');
+                            // Update ADC chart
+                            adcChart.data.labels = data.time;
+                            adcChart.data.datasets[0].data = data.raw_adc;
+                            adcChart.data.datasets[1].data = data.filtered_adc;
+                            adcChart.update('none');
                         }
                     })
                     .catch(error => console.error('Error updating charts:', error));
