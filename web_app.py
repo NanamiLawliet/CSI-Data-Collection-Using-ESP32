@@ -71,7 +71,7 @@ class ESPNOWDataLogger:
             
             # Define what data we'll store in each row
             fieldnames = [
-                'timestamp', 'rssi', 'rate', 'channel', 'bandwidth', 'data_length', 'esp_timestamp', 'csi_data'
+                'timestamp', 'seq', 'raw_adc', 'filtered_adc', 'rssi', 'esp_timestamp'
             ]
             
             self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=fieldnames)
@@ -87,58 +87,43 @@ class ESPNOWDataLogger:
             traceback.print_exc()
             raise
     
-    def parse_csi_line(self, line):
-        """Extract CSI data from the ESP32's output format
+    def parse_espnow_line(self, line):
+        """Extract ESP-NOW data from the ESP32's output format
         
-        The ESP32 sends CSI data in this format:
-        CSI,RSSI=-50,RATE=1,CHAN=1,BW=20,LEN=128,TS=123456,DATA=1,2,3,4,...
+        The ESP32 sends data in this format:
+        RX,SEQ=123,RAW=456,FILT=789,RSSI=-50,TS=123456
         
         We need to:
         1. Parse the comma-separated values
-        2. Extract CSI data array
-        3. Return the parsed data as a dictionary or None if something goes wrong
+        2. Return the parsed data as a dictionary or None if something goes wrong
         """
-        # Pattern to match CSI output: CSI,RSSI=-50,RATE=1,CHAN=1,BW=20,LEN=128,TS=123456,DATA=1,2,3,...
-        pattern = r'CSI,RSSI=(-?\d+),RATE=(\d+),CHAN=(\d+),BW=(\d+),LEN=(\d+),TS=(\d+),DATA=(.+)'
+        # Pattern to match ESP-NOW output: RX,SEQ=123,RAW=456,FILT=789,RSSI=-50,TS=123456
+        pattern = r'RX,SEQ=(\d+),RAW=(-?\d+),FILT=(-?\d+),RSSI=(-?\d+),TS=(\d+)'
         
         match = re.search(pattern, line)
         if match:
             try:
-                rssi = int(match.group(1))
-                rate = int(match.group(2))
-                channel = int(match.group(3))
-                bandwidth = int(match.group(4))
-                data_length = int(match.group(5))
-                esp_timestamp = int(match.group(6))
-                csi_data_str = match.group(7)
-                
-                # Parse CSI data array
-                csi_array = []
-                if csi_data_str:
-                    csi_values = csi_data_str.split(',')
-                    for val in csi_values:
-                        try:
-                            csi_array.append(int(val.strip()))
-                        except ValueError:
-                            continue
+                seq = int(match.group(1))
+                raw_adc = int(match.group(2))
+                filtered_adc = int(match.group(3))
+                rssi = int(match.group(4))
+                esp_timestamp = int(match.group(5))
                 
                 data = {
+                    'seq': seq,
+                    'raw_adc': raw_adc,
+                    'filtered_adc': filtered_adc,
                     'rssi': rssi,
-                    'rate': rate,
-                    'channel': channel,
-                    'bandwidth': bandwidth,
-                    'data_length': data_length,
-                    'esp_timestamp': esp_timestamp,
-                    'csi_data': csi_array
+                    'esp_timestamp': esp_timestamp
                 }
                 
-                print(f"[SUCCESS] Parsed CSI packet: RSSI={rssi}dBm, Rate={rate}, Chan={channel}, Len={data_length}")
+                print(f"[SUCCESS] Parsed ESP-NOW packet: SEQ={seq}, RAW={raw_adc}, FILT={filtered_adc}, RSSI={rssi}dBm, TS={esp_timestamp}")
                 return data
             except ValueError as e:
-                print(f"[ERROR] Failed to parse CSI values: {e}")
+                print(f"[ERROR] Failed to parse ESP-NOW values: {e}")
                 print(f"[ERROR] Line: {line}")
         else:
-            print(f"[WARNING] No CSI data found in: {line[:100]}...")
+            print(f"[WARNING] No ESP-NOW data found in: {line[:100]}...")
         
         return None
     
@@ -149,9 +134,7 @@ class ESPNOWDataLogger:
     def extract_subcarrier_data(self, csi_data, subcarrier_indices):
         """ESP-NOW doesn't have subcarrier data"""
         return {}
-    
-    def analyze_csi_structure(self, csi_data):
-        """
+        
         The ESP32 sends CSI data as an array of integers, where each
         integer represents the signal strength for that subcarrier.
         This function extracts just the values we want to plot.
@@ -230,23 +213,22 @@ class ESPNOWDataLogger:
                             self.raw_lines.append(line)
                         
                         if line:
-                            # Try to parse the CSI data
-                            csi_data = self.parse_csi_line(line)
+                            # Try to parse the ESP-NOW data
+                            espnow_data = self.parse_espnow_line(line)
                             
-                            if csi_data:
+                            if espnow_data:
                                 try:
                                     python_timestamp = datetime.datetime.now().isoformat()
+                                    current_time = time.time()
                                     
                                     # Prepare the row for the CSV file
                                     row = {
                                         'timestamp': python_timestamp,
-                                        'rssi': csi_data.get('rssi', ''),
-                                        'rate': csi_data.get('rate', ''),
-                                        'channel': csi_data.get('channel', ''),
-                                        'bandwidth': csi_data.get('bandwidth', ''),
-                                        'data_length': csi_data.get('data_length', ''),
-                                        'esp_timestamp': csi_data.get('esp_timestamp', ''),
-                                        'csi_data': ','.join(map(str, csi_data.get('csi_data', [])))
+                                        'seq': espnow_data.get('seq', ''),
+                                        'raw_adc': espnow_data.get('raw_adc', ''),
+                                        'filtered_adc': espnow_data.get('filtered_adc', ''),
+                                        'rssi': espnow_data.get('rssi', ''),
+                                        'esp_timestamp': espnow_data.get('esp_timestamp', '')
                                     }
                                     
                                     # Save to CSV - with extra error checking
@@ -399,7 +381,7 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>ESP32 CSI Data Monitor</title>
+        <title>ESP32 CSI Data Monitor with Configurable Plots</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
@@ -684,7 +666,7 @@ def home():
                         <canvas id="rssiChart"></canvas>
                     </div>
                     <div class="chart-container">
-                        <canvas id="subcarrierChart"></canvas>
+                        <canvas id="adcChart"></canvas>
                     </div>
                 </div>
             </div>
@@ -738,7 +720,7 @@ def home():
                 }
             });
             
-            const subcarrierChart = new Chart(document.getElementById('subcarrierChart'), {
+            const adcChart = new Chart(document.getElementById('adcChart'), {
                 type: 'line',
                 data: {
                     labels: [],
@@ -775,32 +757,29 @@ def home():
             
             function updatePlotConfig() {
                 // Update chart title
-                subcarrierChart.options.plugins.title.text = 'CSI Subcarrier Values over Time';
-                subcarrierChart.options.scales.y.title.text = 'CSI Value';
+                adcChart.options.plugins.title.text = 'ADC Values over Time';
+                adcChart.options.scales.y.title.text = 'ADC Value';
                 
                 // Clear existing datasets
-                subcarrierChart.data.datasets = [];
+                adcChart.data.datasets = [];
                 
-                // Create subcarrier datasets (show first 10 subcarriers)
-                const numSubcarriers = 10;
-                const colors = [
-                    'rgb(54, 162, 235)', 'rgb(255, 205, 86)', 'rgb(75, 192, 192)',
-                    'rgb(153, 102, 255)', 'rgb(255, 99, 132)', 'rgb(255, 159, 64)',
-                    'rgb(199, 199, 199)', 'rgb(83, 102, 255)', 'rgb(255, 99, 255)',
-                    'rgb(99, 255, 132)'
+                // Create ADC datasets
+                const adcDatasets = [
+                    { label: 'Raw ADC', key: 'raw_adc', color: 'rgb(54, 162, 235)' },
+                    { label: 'Filtered ADC', key: 'filtered_adc', color: 'rgb(255, 99, 132)' }
                 ];
                 
-                for (let i = 0; i < numSubcarriers; i++) {
-                    subcarrierChart.data.datasets.push({
-                        label: `Subcarrier ${i}`,
+                adcDatasets.forEach(dataset => {
+                    adcChart.data.datasets.push({
+                        label: dataset.label,
                         data: [],
-                        borderColor: colors[i % colors.length],
-                        backgroundColor: colors[i % colors.length].replace('rgb', 'rgba').replace(')', ', 0.2)'),
+                        borderColor: dataset.color,
+                        backgroundColor: dataset.color.replace('rgb', 'rgba').replace(')', ', 0.2)'),
                         tension: 0.1
                     });
-                }
+                });
                 
-                subcarrierChart.update();
+                adcChart.update();
             }
             
             function updateCharts() {
@@ -813,16 +792,11 @@ def home():
                             rssiChart.data.datasets[0].data = data.rssi;
                             rssiChart.update('none');
                             
-                            // Update subcarrier chart
-                            subcarrierChart.data.labels = data.time;
-                            // Update first 10 subcarriers
-                            for (let i = 0; i < Math.min(10, subcarrierChart.data.datasets.length); i++) {
-                                const key = `subcarrier_${i}`;
-                                if (data.subcarriers && data.subcarriers[key]) {
-                                    subcarrierChart.data.datasets[i].data = data.subcarriers[key];
-                                }
-                            }
-                            subcarrierChart.update('none');
+                            // Update ADC chart
+                            adcChart.data.labels = data.time;
+                            adcChart.data.datasets[0].data = data.raw_adc;
+                            adcChart.data.datasets[1].data = data.filtered_adc;
+                            adcChart.update('none');
                         }
                     })
                     .catch(error => console.error('Error updating charts:', error));

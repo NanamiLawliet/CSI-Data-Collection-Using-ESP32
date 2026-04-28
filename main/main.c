@@ -13,7 +13,7 @@
 #include "driver/adc.h"
 
 // Sonradan kolayca değiştirilebilir: sadece aşağıdaki satırı değiştirin.
-#define ESP_NOW_ROLE_MASTER
+#define ESP_NOW_ROLE_SLAVE
 // #define ESP_NOW_ROLE_SLAVE
 
 #define ESPNOW_CHANNEL 1
