@@ -12,12 +12,12 @@
 #include "esp_now.h"
 
 // Sonradan kolayca değiştirilebilir: sadece aşağıdaki satırı değiştirin.
-#define ESP_NOW_ROLE_SLAVE
-// #define ESP_NOW_ROLE_MASTER
+#define ESP_NOW_ROLE_MASTER
+// #define ESP_NOW_ROLE_SLAVE
 
 #define ESPNOW_CHANNEL 1
 #define ESPNOW_TX_POWER_DBM 78
-#define SEND_INTERVAL_MS 100
+#define SEND_INTERVAL_MS 300
 #define CSI_MAX_DATA_LEN 256
 #define CSI_LOG_BUFFER_LEN 2048
 #define SENSOR_PAYLOAD_HEADER_LEN (sizeof(uint32_t) + sizeof(uint32_t))
@@ -26,9 +26,14 @@
 static const uint8_t receiver_mac[ESP_NOW_ETH_ALEN] = {0x08, 0xd1, 0xf9, 0xf6, 0x7c, 0xec};
 #endif
 
-#ifdef ESP_NOW_ROLE_SLAVE
+#ifdef ESP_NOW_ROLE_SLAVE   
 static const uint8_t sender_mac[ESP_NOW_ETH_ALEN]   = {0x68, 0xfe, 0x71, 0x0b, 0xa4, 0x00};
 static QueueHandle_t csi_queue = NULL;
+static uint8_t local_mac[ESP_NOW_ETH_ALEN] = {0};
+static volatile uint32_t csi_callback_count = 0;
+static volatile uint32_t csi_match_count = 0;
+static volatile uint32_t csi_zero_len_count = 0;
+static volatile uint32_t csi_queue_drop_count = 0;
 #endif
 
 static const char *TAG = "ESP_NOW";
@@ -89,6 +94,7 @@ static esp_err_t init_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(ESPNOW_TX_POWER_DBM));
 
@@ -180,8 +186,10 @@ static esp_err_t init_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(ESPNOW_TX_POWER_DBM));
+    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, local_mac));
 
     return ESP_OK;
 }
@@ -208,7 +216,17 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
         return;
     }
 
-    if (memcmp(info->mac, sender_mac, ESP_NOW_ETH_ALEN) != 0) {
+    csi_callback_count++;
+
+    bool sender_match = memcmp(info->mac, sender_mac, ESP_NOW_ETH_ALEN) == 0;
+    bool receiver_match = memcmp(info->dmac, local_mac, ESP_NOW_ETH_ALEN) == 0;
+    if (!(sender_match && receiver_match)) {
+        return;
+    }
+
+    csi_match_count++;
+    if (info->buf == NULL || info->len <= 0) {
+        csi_zero_len_count++;
         return;
     }
 
@@ -229,7 +247,10 @@ static void wifi_csi_cb(void *ctx, wifi_csi_info_t *info)
     memcpy(event.csi_data, info->buf, copy_len);
 
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xQueueSendFromISR(csi_queue, &event, &xHigherPriorityTaskWoken);
+    if (xQueueSendFromISR(csi_queue, &event, &xHigherPriorityTaskWoken) != pdTRUE) {
+        csi_queue_drop_count++;
+        return;
+    }
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
@@ -265,6 +286,19 @@ static void csi_processing_task(void *pvParameter)
     }
 }
 
+static void csi_diagnostic_task(void *pvParameter)
+{
+    while (1) {
+        ESP_LOGI(TAG,
+                 "CSI diag: callbacks=%" PRIu32 " matches=%" PRIu32 " zero_len=%" PRIu32 " queue_drop=%" PRIu32,
+                 csi_callback_count,
+                 csi_match_count,
+                 csi_zero_len_count,
+                 csi_queue_drop_count);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
 static esp_err_t init_csi(void)
 {
     wifi_csi_config_t csi_cfg = {
@@ -272,8 +306,13 @@ static esp_err_t init_csi(void)
         .htltf_en = true,
         .stbc_htltf2_en = true,
         .ltf_merge_en = true,
+        .channel_filter_en = false,
+        .manu_scale = false,
+        .shift = 0,
+        .dump_ack_en = false,
     };
 
+    ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_cfg));
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_cb, NULL));
@@ -286,17 +325,18 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "ESP-NOW Slave (RX) starting...");
 
-    csi_queue = xQueueCreate(8, sizeof(csi_event_t));
+    csi_queue = xQueueCreate(64, sizeof(csi_event_t));
     if (csi_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create CSI queue");
         return;
     }
 
     ESP_ERROR_CHECK(init_wifi());
-    ESP_ERROR_CHECK(init_csi());
     ESP_ERROR_CHECK(init_espnow());
+    ESP_ERROR_CHECK(init_csi());
 
-    xTaskCreate(csi_processing_task, "csi_processing_task", 4096, NULL, 5, NULL);
+    xTaskCreate(csi_processing_task, "csi_processing_task", 8192, NULL, 8, NULL);
+    xTaskCreate(csi_diagnostic_task, "csi_diagnostic_task", 4096, NULL, 1, NULL);
 
     ESP_LOGI(TAG, "Ready and waiting for ESP-NOW packets...");
     while (1) {

@@ -15,6 +15,8 @@ import uuid
 
 CSI_REGEX = re.compile(r'CSI_START(\{.+\})CSI_END')
 ESPNOW_REGEX = re.compile(r'RX,SEQ=(\d+),RSSI=(-?\d+),TS=(\d+)')
+ESPNOW_LOG_REGEX = re.compile(r'seq=(\d+)\s+rssi=(-?\d+)', re.IGNORECASE)
+CSI_DIAG_REGEX = re.compile(r'callbacks=(\d+)\s+matches=(\d+)\s+zero_len=(\d+)\s+queue_drop=(\d+)', re.IGNORECASE)
 
 app = Flask(__name__)
 
@@ -38,6 +40,17 @@ class ESPNOWDataLogger:
         self.plot_data = deque(maxlen=200)
         self.available_subcarriers = set()
         self.raw_lines = deque(maxlen=50)
+        self.raw_line_count = 0
+        self.csi_packet_count = 0
+        self.espnow_packet_count = 0
+        self.last_packet_time = None
+        self.last_csi_time = None
+        self.last_packet_type = None
+        self.last_raw_line = None
+        self.last_raw_line_time = None
+        self.csi_diag = {}
+        self.pending_seq = None
+        self.pending_espnow_timestamp = None
 
     def connect(self):
         try:
@@ -58,8 +71,8 @@ class ESPNOWDataLogger:
             self.csv_file = open(filepath, 'w', newline='', encoding='utf-8')
 
             fieldnames = [
-                'timestamp', 'rssi', 'rate', 'channel', 'bandwidth', 'data_length',
-                'esp_timestamp', 'csi_data', 'seq', 'raw_adc', 'filtered_adc'
+                'timestamp', 'packet_type', 'rssi', 'rate', 'channel', 'bandwidth',
+                'data_length', 'esp_timestamp', 'csi_data', 'seq'
             ]
 
             self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=fieldnames)
@@ -92,20 +105,48 @@ class ESPNOWDataLogger:
 
     def parse_espnow_line(self, line):
         match = ESPNOW_REGEX.search(line)
+        if match:
+            try:
+                return {
+                    'seq': int(match.group(1)),
+                    'rssi': int(match.group(2)),
+                    'esp_timestamp': int(match.group(3))
+                }
+            except ValueError as e:
+                print(f"[ERROR] ESP-NOW parse failed: {e} | line={line}")
+                return None
+
+        match = ESPNOW_LOG_REGEX.search(line)
+        if match:
+            try:
+                return {
+                    'seq': int(match.group(1)),
+                    'rssi': int(match.group(2)),
+                    'esp_timestamp': 0
+                }
+            except ValueError as e:
+                print(f"[ERROR] ESP-NOW log parse failed: {e} | line={line}")
+                return None
+
+        return None
+
+    def parse_csi_diag_line(self, line):
+        match = CSI_DIAG_REGEX.search(line)
         if not match:
             return None
 
         try:
             return {
-                'seq': int(match.group(1)),
-                'rssi': int(match.group(2)),
-                'esp_timestamp': int(match.group(3))
+                'callbacks': int(match.group(1)),
+                'matches': int(match.group(2)),
+                'zero_len': int(match.group(3)),
+                'queue_drop': int(match.group(4)),
             }
         except ValueError as e:
-            print(f"[ERROR] ESP-NOW parse failed: {e} | line={line}")
+            print(f"[ERROR] CSI diag parse failed: {e} | line={line}")
             return None
 
-    def _process_packet(self, packet):
+    def _process_packet(self, packet, packet_type='unknown'):
         python_timestamp = datetime.datetime.now().isoformat()
         csi_data = packet.get('csi_data', [])
         if isinstance(csi_data, str):
@@ -115,8 +156,18 @@ class ESPNOWDataLogger:
                 csi_data = []
 
         data_length = packet.get('data_length', len(csi_data) if isinstance(csi_data, list) else 0)
+        seq = packet.get('seq', '')
+        if packet_type == 'espnow':
+            self.pending_seq = packet.get('seq')
+            self.pending_espnow_timestamp = time.time()
+        elif packet_type == 'csi' and (seq == '' or seq is None or seq == 0):
+            if self.pending_seq is not None and self.pending_espnow_timestamp is not None:
+                if time.time() - self.pending_espnow_timestamp <= 1.0:
+                    seq = self.pending_seq
+
         row = {
             'timestamp': python_timestamp,
+            'packet_type': packet_type,
             'rssi': packet.get('rssi', 0),
             'rate': packet.get('rate', 0),
             'channel': packet.get('channel', 0),
@@ -124,10 +175,11 @@ class ESPNOWDataLogger:
             'data_length': data_length,
             'esp_timestamp': packet.get('esp_timestamp', 0),
             'csi_data': json.dumps(csi_data) if csi_data else '[]',
-            'seq': packet.get('seq', ''),
+            'seq': seq,
         }
 
-        if self.csv_writer:
+        should_write_csv = packet_type == 'csi' and data_length > 0
+        if self.csv_writer and should_write_csv:
             try:
                 self.csv_writer.writerow(row)
                 self.csv_file.flush()
@@ -135,6 +187,14 @@ class ESPNOWDataLogger:
                 print(f"[ERROR] Failed to write CSV row: {exc}")
 
         self.packet_count += 1
+        self.last_packet_time = time.time()
+        self.last_packet_type = packet_type
+        if packet_type == 'csi':
+            self.csi_packet_count += 1
+            self.last_csi_time = self.last_packet_time
+        elif packet_type == 'espnow':
+            self.espnow_packet_count += 1
+
         display_data = {
             'packet_num': self.packet_count,
             'timestamp': python_timestamp,
@@ -144,7 +204,8 @@ class ESPNOWDataLogger:
             'bandwidth': packet.get('bandwidth', 0),
             'data_length': data_length,
             'esp_timestamp': packet.get('esp_timestamp', 0),
-            'seq': packet.get('seq', 0),
+            'seq': seq,
+            'packet_type': packet_type,
             'time_passed': time.time() - self.session_start_time if self.session_start_time else 0,
         }
 
@@ -169,14 +230,21 @@ class ESPNOWDataLogger:
                         line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
                         if line:
                             self.raw_lines.append(line)
+                            self.raw_line_count += 1
+                            self.last_raw_line = line
+                            self.last_raw_line_time = time.time()
                             packet = self.parse_csi_line(line)
+                            packet_type = 'csi'
                             if packet is None:
                                 packet = self.parse_espnow_line(line)
+                                packet_type = 'espnow'
 
                             if packet is not None:
-                                self._process_packet(packet)
+                                self._process_packet(packet, packet_type=packet_type)
                             else:
-                                print(f"ESP32: {line}")
+                                diag = self.parse_csi_diag_line(line)
+                                if diag is not None:
+                                    self.csi_diag = diag
                     except Exception as e:
                         print(f"Error processing serial line: {e}")
                         import traceback
@@ -214,10 +282,28 @@ class ESPNOWDataLogger:
         self._close_csv_file()
 
     def get_status(self):
+        now = time.time()
+        csi_age = None
+        raw_age = None
+        if self.last_csi_time is not None:
+            csi_age = round(now - self.last_csi_time, 2)
+        if self.last_raw_line_time is not None:
+            raw_age = round(now - self.last_raw_line_time, 2)
+
         return {
             'connected': self.serial_conn is not None and self.serial_conn.is_open,
             'logging': self.is_running,
             'packet_count': self.packet_count,
+            'raw_line_count': self.raw_line_count,
+            'csi_packet_count': self.csi_packet_count,
+            'espnow_packet_count': self.espnow_packet_count,
+            'last_packet_type': self.last_packet_type,
+            'serial_receiving': self.last_raw_line_time is not None and (now - self.last_raw_line_time) <= 3,
+            'last_raw_seconds_ago': raw_age,
+            'last_raw_line': self.last_raw_line,
+            'csi_receiving': self.last_csi_time is not None and (now - self.last_csi_time) <= 3,
+            'last_csi_seconds_ago': csi_age,
+            'csi_diag': self.csi_diag,
             'port': self.port,
             'session_id': self.session_id,
             'session_dir': self.session_dir
@@ -396,6 +482,26 @@ def home():
                 color: var(--light-text);
             }
 
+            .csi-live {
+                background: #2d6a4f;
+                color: var(--light-text);
+            }
+
+            .csi-waiting {
+                background: #b08968;
+                color: var(--light-text);
+            }
+
+            .serial-live {
+                background: #457b9d;
+                color: var(--light-text);
+            }
+
+            .serial-waiting {
+                background: #8d99ae;
+                color: var(--light-text);
+            }
+
             button { 
                 padding: 12px 24px; 
                 margin: 5px; 
@@ -495,6 +601,52 @@ def home():
                 gap: 10px;
             }
 
+            .subcarrier-browser {
+                width: 100%;
+                max-height: 220px;
+                overflow-y: auto;
+                background: white;
+                border: 1px solid #d8dee6;
+                padding: 14px;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+
+            .subcarrier-status {
+                width: 100%;
+                font-family: 'IBM Plex Mono', monospace;
+                font-size: 0.9em;
+                color: var(--secondary-color);
+            }
+
+            .subcarrier-chip {
+                border: 1px solid var(--accent-color);
+                background: #ffffff;
+                color: var(--dark-text);
+                padding: 7px 10px;
+                font-size: 0.85em;
+                cursor: pointer;
+                user-select: none;
+                font-family: 'IBM Plex Mono', monospace;
+            }
+
+            .subcarrier-chip.pending {
+                background: #f4d58d;
+                border-color: #d4a373;
+            }
+
+            .subcarrier-chip.selected {
+                background: var(--accent-color);
+                color: var(--light-text);
+            }
+
+            .subcarrier-empty {
+                font-family: 'IBM Plex Mono', monospace;
+                font-size: 0.9em;
+                color: var(--secondary-color);
+            }
+
             select, input[type="text"] { 
                 padding: 10px 15px; 
                 border: 2px solid var(--accent-color); 
@@ -553,12 +705,14 @@ def home():
                 <div class="status" id="status">
                     <div class="status-item disconnected">Disconnected</div>
                     <div class="status-item stopped">Not Logging</div>
+                    <div class="status-item serial-waiting">Serial Waiting</div>
+                    <div class="status-item csi-waiting">CSI Waiting</div>
                     <div>Packets: <span id="packet-count">0</span></div>
                     <div>Session: <span id="session-id">None</span></div>
                 </div>
                 
                 <div style="margin-top: 15px;">
-                    <input type="text" id="port-input" placeholder="COM10 or /dev/ttyUSB0" style="padding: 8px; width: 200px;">
+                    <input type="text" id="port-input" placeholder="COM9 (slave/RX) or /dev/ttyUSB0" style="padding: 8px; width: 200px;">
                     <button class="btn-primary" onclick="connect()">Connect</button>
                     <button class="btn-danger" onclick="disconnect()">Disconnect</button>
                     <button class="btn-success" onclick="startLogging()">Start Logging</button>
@@ -566,11 +720,17 @@ def home():
                 </div>
                 <div class="plot-controls">
                     <div class="control-group">
-                        <label for="subcarrier-select">Subcarriers</label>
-                        <select id="subcarrier-select" multiple size="4" class="multi-select"></select>
+                        <label>Subcarriers</label>
+                    </div>
+                    <div class="control-group">
+                        <button class="btn-primary" onclick="addPendingSubcarriers()">Add</button>
                     </div>
                     <div class="control-group">
                         <button class="btn-primary" onclick="refreshSubcarriers()">Refresh Subcarriers</button>
+                    </div>
+                    <div id="subcarrier-status" class="subcarrier-status">Click subcarriers to stage them, then press Add.</div>
+                    <div id="subcarrier-browser" class="subcarrier-browser">
+                        <div class="subcarrier-empty">Waiting for discovered subcarriers...</div>
                     </div>
                 </div>
             </div>
@@ -579,6 +739,13 @@ def home():
                 <h3>Latest CSI Data</h3>
                 <div class="latest-data" id="latest-data">
                     <div class="data-item">No data yet...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Serial Diagnostics</h3>
+                <div class="latest-data" id="serial-diagnostics">
+                    <div class="data-item">Waiting for serial data...</div>
                 </div>
             </div>
             
@@ -611,7 +778,11 @@ def home():
                         data: [],
                         borderColor: 'rgb(255, 99, 132)',
                         backgroundColor: 'rgba(255, 99, 132, 0.2)',
-                        tension: 0.1
+                        tension: 0.1,
+                        pointRadius: 0,
+                        pointHoverRadius: 3,
+                        spanGaps: true,
+                        borderWidth: 2
                     }]
                 },
                 options: {
@@ -643,6 +814,10 @@ def home():
                 }
             });
             
+            const hiddenCsiSeries = new Set();
+            const customSubcarriers = new Set();
+            const pendingSubcarriers = new Set();
+
             const csiChart = new Chart(document.getElementById('csiChart'), {
                 type: 'line',
                 data: {
@@ -656,6 +831,25 @@ def home():
                         title: {
                             display: true,
                             text: 'CSI Values over Time'
+                        },
+                        legend: {
+                            onClick: (event, legendItem, legend) => {
+                                const chart = legend.chart;
+                                const dataset = chart.data.datasets[legendItem.datasetIndex];
+                                if (!dataset) {
+                                    return;
+                                }
+
+                                const label = dataset.label;
+                                if (hiddenCsiSeries.has(label)) {
+                                    hiddenCsiSeries.delete(label);
+                                    dataset.hidden = false;
+                                } else {
+                                    hiddenCsiSeries.add(label);
+                                    dataset.hidden = true;
+                                }
+                                chart.update();
+                            }
                         }
                     },
                     scales: {
@@ -679,39 +873,76 @@ def home():
             });
             
             function updatePlotConfig() {
-                // Update chart title
                 csiChart.options.plugins.title.text = 'CSI Values over Time';
                 csiChart.options.scales.y.title.text = 'CSI Value';
-                
-                // Clear existing datasets
                 csiChart.data.datasets = [];
-                
-                // Create CSI datasets
-                const csiDatasets = [
-                    { label: 'Raw CSI', key: 'raw_csi', color: 'rgb(54, 162, 235)' },
-                    { label: 'Filtered CSI', key: 'filtered_csi', color: 'rgb(255, 99, 132)' }
-                ];
-                
-                csiDatasets.forEach(dataset => {
-                    csiChart.data.datasets.push({
-                        label: dataset.label,
-                        data: [],
-                        borderColor: dataset.color,
-                        backgroundColor: dataset.color.replace('rgb', 'rgba').replace(')', ', 0.2)'),
-                        tension: 0.1
-                    });
-                });
-                
                 csiChart.update();
             }
             
             function getSelectedSubcarriers() {
-                const select = document.getElementById('subcarrier-select');
-                if (!select) {
-                    return [1, 5, 9, 13];
-                }
-                const selected = Array.from(select.selectedOptions).map(option => parseInt(option.value, 10));
+                const selected = Array.from(customSubcarriers).sort((a, b) => a - b);
                 return selected.length ? selected : [1, 5, 9, 13];
+            }
+
+            function renderSubcarrierStatus() {
+                const status = document.getElementById('subcarrier-status');
+                if (!status) {
+                    return;
+                }
+
+                if (pendingSubcarriers.size === 0) {
+                    status.textContent = 'Click subcarriers to stage them, then press Add.';
+                    return;
+                }
+
+                status.textContent = `Staged: ${Array.from(pendingSubcarriers).sort((a, b) => a - b).join(', ')}`;
+            }
+
+            function renderSubcarrierBrowser(allSubcarriers = []) {
+                const browser = document.getElementById('subcarrier-browser');
+                if (!browser) {
+                    return;
+                }
+
+                if (!allSubcarriers.length) {
+                    browser.innerHTML = '<div class="subcarrier-empty">Waiting for discovered subcarriers...</div>';
+                    return;
+                }
+
+                browser.innerHTML = '';
+                allSubcarriers.forEach(value => {
+                    const chip = document.createElement('button');
+                    chip.type = 'button';
+                    const isPending = pendingSubcarriers.has(value);
+                    const isSelected = customSubcarriers.has(value);
+                    chip.className = `subcarrier-chip${isPending ? ' pending' : ''}${isSelected ? ' selected' : ''}`;
+                    chip.textContent = `Subcarrier ${value}`;
+                    chip.onclick = () => {
+                        if (isSelected) {
+                            customSubcarriers.delete(value);
+                            hiddenCsiSeries.delete(`subcarrier_${value}`);
+                            updateCharts();
+                        } else if (pendingSubcarriers.has(value)) {
+                            pendingSubcarriers.delete(value);
+                        } else {
+                            pendingSubcarriers.add(value);
+                        }
+                        renderSubcarrierStatus();
+                        renderSubcarrierBrowser(allSubcarriers);
+                    };
+                    browser.appendChild(chip);
+                });
+            }
+
+            function addPendingSubcarriers() {
+                if (pendingSubcarriers.size === 0) {
+                    return;
+                }
+
+                pendingSubcarriers.forEach(value => customSubcarriers.add(value));
+                pendingSubcarriers.clear();
+                renderSubcarrierStatus();
+                refreshSubcarriers();
             }
 
             function updateCharts() {
@@ -727,23 +958,27 @@ def home():
                             csiChart.data.labels = data.time;
                             csiChart.data.datasets = [];
 
-                            csiChart.data.datasets.push({
-                                label: 'RSSI',
-                                data: data.rssi,
-                                borderColor: 'rgb(255, 99, 132)',
-                                backgroundColor: 'rgba(255, 99, 132, 0.2)',
-                                tension: 0.1
-                            });
-
                             if (data.subcarriers) {
                                 Object.keys(data.subcarriers).forEach((key, index) => {
-                                    const color = ['rgb(54, 162, 235)', 'rgb(75, 192, 192)', 'rgb(255, 206, 86)', 'rgb(153, 102, 255)'][index % 4];
+                                    const color = [
+                                        'rgb(54, 162, 235)',
+                                        'rgb(75, 192, 192)',
+                                        'rgb(255, 206, 86)',
+                                        'rgb(153, 102, 255)',
+                                        'rgb(255, 99, 132)',
+                                        'rgb(201, 203, 207)'
+                                    ][index % 6];
                                     csiChart.data.datasets.push({
                                         label: key,
                                         data: data.subcarriers[key],
                                         borderColor: color,
                                         backgroundColor: color.replace('rgb', 'rgba').replace(')', ', 0.2)'),
-                                        tension: 0.1
+                                        tension: 0.1,
+                                        pointRadius: 0,
+                                        pointHoverRadius: 3,
+                                        spanGaps: true,
+                                        borderWidth: 2,
+                                        hidden: hiddenCsiSeries.has(key)
                                     });
                                 });
                             }
@@ -758,18 +993,22 @@ def home():
                 fetch('/api/subcarriers')
                     .then(response => response.json())
                     .then(data => {
-                        const select = document.getElementById('subcarrier-select');
-                        if (!select) return;
-                        select.innerHTML = '';
-                        data.slice(0, 16).forEach(index => {
-                            const option = document.createElement('option');
-                            option.value = index;
-                            option.textContent = `Subcarrier ${index}`;
-                            if ([1, 5, 9, 13].includes(index)) {
-                                option.selected = true;
-                            }
-                            select.appendChild(option);
-                        });
+                        const merged = Array.from(new Set([
+                            ...data,
+                            ...Array.from(customSubcarriers),
+                            ...Array.from(pendingSubcarriers)
+                        ])).sort((a, b) => a - b);
+
+                        if (customSubcarriers.size === 0) {
+                            [1, 5, 9, 13].forEach(index => {
+                                if (merged.includes(index)) {
+                                    customSubcarriers.add(index);
+                                }
+                            });
+                        }
+
+                        renderSubcarrierStatus();
+                        renderSubcarrierBrowser(merged);
                         updateCharts();
                     })
                     .catch(error => console.error('Error loading subcarriers:', error));
@@ -784,13 +1023,39 @@ def home():
                         const connText = data.connected ? 'Connected' : 'Disconnected';
                         const logClass = data.logging ? 'logging' : 'stopped';
                         const logText = data.logging ? 'Logging' : 'Not Logging';
+                        const serialClass = data.serial_receiving ? 'serial-live' : 'serial-waiting';
+                        const serialText = data.serial_receiving ? 'Serial Live' : 'Serial Waiting';
+                        const serialAgeText = data.last_raw_seconds_ago == null ? 'No serial yet' : `${data.last_raw_seconds_ago}s ago`;
+                        const csiClass = data.csi_receiving ? 'csi-live' : 'csi-waiting';
+                        const csiText = data.csi_receiving ? 'CSI Live' : 'CSI Waiting';
+                        const csiAgeText = data.last_csi_seconds_ago == null ? 'No CSI yet' : `${data.last_csi_seconds_ago}s ago`;
+                        const csiDiag = data.csi_diag || {};
                         
                         statusDiv.innerHTML = `
                             <div class="status-item ${connClass}">${connText} ${data.port ? '(' + data.port + ')' : ''}</div>
                             <div class="status-item ${logClass}">${logText}</div>
+                            <div class="status-item ${serialClass}">${serialText}</div>
+                            <div class="status-item ${csiClass}">${csiText}</div>
                             <div>Packets: <span id="packet-count">${data.packet_count}</span></div>
+                            <div>Raw Lines: <span>${data.raw_line_count || 0}</span></div>
+                            <div>Last Serial: <span>${serialAgeText}</span></div>
+                            <div>CSI Packets: <span>${data.csi_packet_count || 0}</span></div>
+                            <div>Last CSI: <span>${csiAgeText}</span></div>
                             <div>Session: <span id="session-id">${data.session_id || 'None'}</span></div>
                         `;
+
+                        const serialDiv = document.getElementById('serial-diagnostics');
+                        if (serialDiv) {
+                            serialDiv.innerHTML = `
+                                <div class="data-item"><strong>Raw Line Count:</strong> ${data.raw_line_count || 0}</div>
+                                <div class="data-item"><strong>Serial Status:</strong> ${serialText}</div>
+                                <div class="data-item"><strong>Last Serial:</strong> ${serialAgeText}</div>
+                                <div class="data-item"><strong>CSI Callbacks:</strong> ${csiDiag.callbacks ?? 0}</div>
+                                <div class="data-item"><strong>CSI Matches:</strong> ${csiDiag.matches ?? 0}</div>
+                                <div class="data-item"><strong>CSI Zero Len:</strong> ${csiDiag.zero_len ?? 0}</div>
+                                <div class="data-item"><strong>CSI Queue Drop:</strong> ${csiDiag.queue_drop ?? 0}</div>
+                            `;
+                        }
                     });
             }
             
@@ -812,6 +1077,7 @@ def home():
                 fetch('/api/latest')
                     .then(response => response.json())
                     .then(data => {
+                        const formatSubcarrier = value => value == null ? 'N/A' : Number(value).toFixed(2);
                         if (Object.keys(data).length > 0) {
                             const latestDiv = document.getElementById('latest-data');
                             latestDiv.innerHTML = `
@@ -821,13 +1087,16 @@ def home():
                                 <div class="data-item"><strong>Channel:</strong> ${data.channel}</div>
                                 <div class="data-item"><strong>Bandwidth:</strong> ${data.bandwidth}</div>
                                 <div class="data-item"><strong>Data Length:</strong> ${data.data_length}</div>
+                                <div class="data-item"><strong>Packet Type:</strong> ${data.packet_type || 'N/A'}</div>
                                 <div class="data-item"><strong>Timestamp:</strong> ${data.timestamp ? data.timestamp.split('T')[1].split('.')[0] : 'N/A'}</div>
                                 <div class="data-item"><strong>Time Passed:</strong> ${data.time_passed ? formatTimePassed(data.time_passed) : 'N/A'}</div>
-                                <div class="data-item"><strong>SC1 Value:</strong> ${data.subcarrier_1 ? data.subcarrier_1.toFixed(2) : 'N/A'}</div>
-                                <div class="data-item"><strong>SC5 Value:</strong> ${data.subcarrier_5 ? data.subcarrier_5.toFixed(2) : 'N/A'}</div>
-                                <div class="data-item"><strong>SC9 Value:</strong> ${data.subcarrier_9 ? data.subcarrier_9.toFixed(2) : 'N/A'}</div>
-                                <div class="data-item"><strong>SC13 Value:</strong> ${data.subcarrier_13 ? data.subcarrier_13.toFixed(2) : 'N/A'}</div>
+                                <div class="data-item"><strong>SC1 Value:</strong> ${formatSubcarrier(data.subcarrier_1)}</div>
+                                <div class="data-item"><strong>SC5 Value:</strong> ${formatSubcarrier(data.subcarrier_5)}</div>
+                                <div class="data-item"><strong>SC9 Value:</strong> ${formatSubcarrier(data.subcarrier_9)}</div>
+                                <div class="data-item"><strong>SC13 Value:</strong> ${formatSubcarrier(data.subcarrier_13)}</div>
                             `;
+                        } else {
+                            document.getElementById('latest-data').innerHTML = '<div class="data-item">Waiting for CSI data...</div>';
                         }
                     });
             }
@@ -836,35 +1105,27 @@ def home():
                 fetch('/api/recent')
                     .then(response => response.json())
                     .then(data => {
+                        const formatSubcarrier = value => value == null ? 'N/A' : Number(value).toFixed(2);
                         const logDiv = document.getElementById('data-log');
                         if (data.length > 0) {
                             logDiv.innerHTML = data.slice(-15).reverse().map(packet => 
-                                `<div>Packet #${packet.packet_num}: Value=${packet.subcarrier_1 ? packet.subcarrier_1.toFixed(2) : 'N/A'}, Time=${packet.time_passed ? formatTimePassed(packet.time_passed) : 'N/A'} [${packet.timestamp ? packet.timestamp.split('T')[1].split('.')[0] : 'N/A'}]</div>`
+                                `<div>Packet #${packet.packet_num} (${packet.packet_type || 'unknown'}): Value=${formatSubcarrier(packet.subcarrier_1)}, Time=${packet.time_passed ? formatTimePassed(packet.time_passed) : 'N/A'} [${packet.timestamp ? packet.timestamp.split('T')[1].split('.')[0] : 'N/A'}]</div>`
                             ).join('');
                             logDiv.scrollTop = 0;
+                        } else {
+                            logDiv.innerHTML = '<div>Waiting for CSI data...</div>';
                         }
                     });
-            
-            // also fetch raw serial lines for debugging
-            fetch('/api/raw')
-                .then(response => response.json())
-                .then(lines => {
-                    if (lines && lines.length) {
-                        console.log('raw lines:', lines.slice(-10));
-                    }
-                });
             }
             
             function connect() {
-                const port = document.getElementById('port-input').value || 'COM10';
+                const port = document.getElementById('port-input').value || 'COM9';
                 fetch('/api/connect', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({port: port})
                 }).then(response => response.json())
                   .then(data => {
-                      console.log('connect response', data);
-                      // refresh status right away
                       updateStatus();
                   });
             }
@@ -938,19 +1199,14 @@ def api_plot_data():
 @app.route('/api/raw')
 def api_raw():
     if logger:
-        raw_data = logger.get_raw_lines()
-        # Show detailed info about raw lines
-        print(f"[DEBUG] Raw lines count: {len(raw_data)}")
-        if raw_data:
-            print(f"[DEBUG] Last raw line: {raw_data[-1][:200]}")
-        return jsonify(raw_data)
+        return jsonify(logger.get_raw_lines())
     return jsonify([])
 
 @app.route('/api/connect', methods=['POST'])
 def api_connect():
     global logger
     data = request.get_json()
-    port = data.get('port', 'COM10')
+    port = data.get('port', 'COM9')
     print(f"\n{'='*60}")
     print(f"[API] api_connect called with port={port}")
     print(f"{'='*60}\n")
