@@ -303,9 +303,9 @@ class CsiLogViewer:
         if data_length <= 0:
             return
 
-        tx_id  = int(pkt.get('tx_id', 0))
-        elapsed_ms = (time.time() - self.session_start) * 1000
-        group_id   = int(elapsed_ms / GROUP_WINDOW_MS)
+        tx_id     = int(pkt.get('tx_id', 0))
+        esp_ts_us = int(pkt.get('esp_timestamp', 0))
+        group_id  = int((esp_ts_us / 1000) / GROUP_WINDOW_MS)
 
         csi_data = pkt.get('csi_data', [])
         row = {

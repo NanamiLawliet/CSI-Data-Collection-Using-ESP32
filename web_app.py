@@ -176,10 +176,10 @@ class ESPNOWDataLogger:
 
         tx_id = int(packet.get('tx_id', 0))
 
-        group_id = 0
-        if self.session_start_time:
-            elapsed_ms = (time.time() - self.session_start_time) * 1000
-            group_id = int(elapsed_ms / GROUP_WINDOW_MS)
+        # Use ESP32 hardware timestamp (µs) so both TXs get the same group_id
+        # regardless of when Python dequeues them from the serial buffer.
+        esp_ts_us = int(packet.get('esp_timestamp', 0))
+        group_id = int((esp_ts_us / 1000) / GROUP_WINDOW_MS)
 
         csi_data = packet.get('csi_data', [])
         if isinstance(csi_data, str):
