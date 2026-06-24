@@ -17,7 +17,7 @@
 
 #define ESPNOW_CHANNEL 1
 #define ESPNOW_TX_POWER_DBM 78
-#define SEND_INTERVAL_MS 300
+#define SEND_INTERVAL_MS 50
 #define CSI_MAX_DATA_LEN 256
 #define CSI_LOG_BUFFER_LEN 2048
 #define SENSOR_PAYLOAD_HEADER_LEN (sizeof(uint32_t) + sizeof(uint32_t))
@@ -26,7 +26,7 @@
 static const uint8_t receiver_mac[ESP_NOW_ETH_ALEN] = {0x08, 0xd1, 0xf9, 0xf6, 0x7c, 0xec};
 #endif
 
-#ifdef ESP_NOW_ROLE_SLAVE   
+#ifdef ESP_NOW_ROLE_SLAVE           
 static const uint8_t sender_mac[ESP_NOW_ETH_ALEN]   = {0x68, 0xfe, 0x71, 0x0b, 0xa4, 0x00};
 static QueueHandle_t csi_queue = NULL;
 static uint8_t local_mac[ESP_NOW_ETH_ALEN] = {0};
