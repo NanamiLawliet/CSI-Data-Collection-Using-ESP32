@@ -278,7 +278,7 @@ class CentralControlApp:
 
     def query_device_via_serial(self, port_name, verbose=False):
         try:
-            with serial.Serial(port_name, 115200, timeout=0.5, dsrdtr=False, rtscts=False) as ser:
+            with serial.Serial(port_name, 921600, timeout=0.5, dsrdtr=False, rtscts=False) as ser:
                 ser.dtr = False
                 ser.rts = False
                 # Wait 1.0 second for initial boot phase
@@ -396,7 +396,7 @@ class CentralControlApp:
         if com:
             self.log_message(f"Attempting to write command over Serial ({com})...")
             try:
-                with serial.Serial(com, 115200, timeout=1.0, dsrdtr=False, rtscts=False) as ser:
+                with serial.Serial(com, 921600, timeout=1.0, dsrdtr=False, rtscts=False) as ser:
                     ser.dtr = False
                     ser.rts = False
                     # Wait 1.2 seconds for the ESP32 to boot up after hardware reset

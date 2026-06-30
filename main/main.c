@@ -158,31 +158,19 @@ static void process_config_command(const char *cmd)
             new_role = 2;
         } else if (strncmp(role_str, "TRANSMITTER", 11) == 0) {
             new_role = 1;
-            const char *mac_ptr = strchr(role_str, ':');
-            if (mac_ptr) {
-                mac_ptr++;
-                unsigned int m[6];
-                int parsed = sscanf(mac_ptr, "%02x:%02x:%02x:%02x:%02x:%02x",
-                                    &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]);
-                if (parsed == 6) {
-                    for (int i = 0; i < 6; i++) {
-                        new_peer_mac[i] = (uint8_t)m[i];
-                    }
+            unsigned int m[6];
+            unsigned int parsed_tx_id = 1;
+            int parsed = sscanf(role_str, "TRANSMITTER:%02x:%02x:%02x:%02x:%02x:%02x:%u",
+                                &m[0], &m[1], &m[2], &m[3], &m[4], &m[5], &parsed_tx_id);
+            if (parsed >= 6) {
+                for (int i = 0; i < 6; i++) {
+                    new_peer_mac[i] = (uint8_t)m[i];
                 }
-                
-                // Parse optional tx_id (located after the 6th colon of the MAC address)
-                int colon_count = 0;
-                const char *temp = mac_ptr;
-                while (*temp) {
-                    if (*temp == ':') {
-                        colon_count++;
-                        if (colon_count == 6) {
-                            new_tx_id = atoi(temp + 1);
-                            break;
-                        }
-                    }
-                    temp++;
-                }
+            }
+            if (parsed == 7) {
+                new_tx_id = (uint8_t)parsed_tx_id;
+            } else {
+                new_tx_id = 1;
             }
         } else {
             ESP_LOGE(TAG, "Unknown role input: %s", role_str);
@@ -531,7 +519,7 @@ void app_main(void)
 {
     // Configure UART0
     uart_config_t uart_config = {
-        .baud_rate = 115200,
+        .baud_rate = 921600,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,

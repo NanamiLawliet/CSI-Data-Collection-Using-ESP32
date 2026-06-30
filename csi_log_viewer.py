@@ -42,8 +42,12 @@ FIELDNAMES = [
 
 SC_INDICES = [1, 5, 9, 13]
 
-TX_TAGS   = {'1': 'tx1', '2': 'tx2', '3': 'tx3', '4': 'tx4'}
-TX_COLORS = {'tx1': '#3ea6ff', 'tx2': '#ff6b6b', 'tx3': '#4ecdc4', 'tx4': '#ffd93d'}
+TX_TAGS   = {str(i): f'tx{i}' for i in range(1, 11)}
+TX_COLORS = {
+    'tx1': '#3ea6ff', 'tx2': '#ff6b6b', 'tx3': '#4ecdc4', 'tx4': '#ffd93d',
+    'tx5': '#a8e6cf', 'tx6': '#dcedc1', 'tx7': '#ffd3b6', 'tx8': '#ffaaa5',
+    'tx9': '#ff8b94', 'tx10': '#b5eedd'
+}
 
 
 def _find_latest_csv():
@@ -222,7 +226,7 @@ class CsiLogViewer:
             return
         port = self.port_var.get().strip()
         try:
-            self.serial_conn = serial.Serial(port, 115200, timeout=1)
+            self.serial_conn = serial.Serial(port, 921600, timeout=1)
         except Exception as e:
             self.status_var.set(f"Serial error: {e}")
             return
