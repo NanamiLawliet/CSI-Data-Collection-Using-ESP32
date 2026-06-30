@@ -42,11 +42,9 @@ FIELDNAMES = [
 
 SC_INDICES = [1, 5, 9, 13]
 
-TX_TAGS   = {str(i): f'tx{i}' for i in range(1, 11)}
-TX_COLORS = {
-    'tx1': '#3ea6ff', 'tx2': '#ff6b6b', 'tx3': '#4ecdc4', 'tx4': '#ffd93d',
-    'tx5': '#a8e6cf', 'tx6': '#dcedc1', 'tx7': '#ffd3b6', 'tx8': '#ffaaa5',
-    'tx9': '#ff8b94', 'tx10': '#b5eedd'
+GROUP_COLORS = {
+    'group_even': '#3ea6ff',  # Soft blue
+    'group_odd':  '#4ecdc4',  # Soft teal
 }
 
 
@@ -200,8 +198,8 @@ class CsiLogViewer:
         self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         hsb.pack(fill=tk.X)
 
-        for tag, color in TX_COLORS.items():
-            self.text.tag_config(tag, foreground=color, font=("Consolas", 9, "bold"))
+        for tag, color in GROUP_COLORS.items():
+            self.text.tag_config(tag, foreground=color, font=("Consolas", 9))
         self.text.tag_config("header", foreground="#6a9955", font=("Consolas", 8))
         self.text.tag_config("dim",    foreground="#444444")
 
@@ -444,7 +442,11 @@ class CsiLogViewer:
             return
         self.text.config(state=tk.NORMAL)
         for row in rows:
-            tag = TX_TAGS.get(str(row.get('tx_id', '0')), 'dim')
+            try:
+                grp = int(row.get('group_id', 0))
+            except (ValueError, TypeError):
+                grp = 0
+            tag = "group_even" if (grp % 2 == 0) else "group_odd"
             self.text.insert(tk.END, self._fmt_row(row), tag)
         self.text.config(state=tk.DISABLED)
         if self.auto_scroll.get():
