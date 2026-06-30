@@ -224,7 +224,7 @@ class CsiLogViewer:
             return
         port = self.port_var.get().strip()
         try:
-            self.serial_conn = serial.Serial(port, 921600, timeout=1)
+            self.serial_conn = serial.Serial(port, 2000000, timeout=1)
         except Exception as e:
             self.status_var.set(f"Serial error: {e}")
             return
