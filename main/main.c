@@ -59,6 +59,7 @@ static uint8_t s_tx_id = 1;
 
 static bool s_wifi_connected = false;
 static char s_ip_addr[16] = "0.0.0.0";
+static int64_t s_mute_csi_until = 0; // Temp silent window for UART queries
 
 // ── Dynamic Transmitter Mapping (For Receiver CSI Logs) ──────────────────────
 #define MAX_KNOWN_TRANSMITTERS 10
@@ -244,6 +245,7 @@ static void serial_rx_task(void *pvParameters)
         uint8_t c;
         int len = uart_read_bytes(UART_NUM_0, &c, 1, pdMS_TO_TICKS(50));
         if (len > 0) {
+            s_mute_csi_until = esp_timer_get_time() + 1500000;
             if (c == '\n' || c == '\r') {
                 if (index > 0) {
                     rx_buffer[index] = '\0';
@@ -432,6 +434,9 @@ static void csi_processing_task(void *pvParameter)
 {
     csi_event_t event;
     while (xQueueReceive(csi_queue, &event, portMAX_DELAY) == pdTRUE) {
+        if (esp_timer_get_time() < s_mute_csi_until) {
+            continue;
+        }
         char csi_log[CSI_LOG_BUFFER_LEN];
         int written = snprintf(csi_log,
                                sizeof(csi_log),
