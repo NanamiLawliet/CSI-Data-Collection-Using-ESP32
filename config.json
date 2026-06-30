@@ -1,0 +1,16 @@
+{
+    "devices": {
+        "08:D1:F9:F6:7C:EC": {
+            "port": "COM9",
+            "role": "TRANSMITTER",
+            "peer_mac": "68:FE:71:0C:91:3C",
+            "tx_id": 1
+        },
+        "68:FE:71:0C:91:3C": {
+            "port": "COM11",
+            "role": "RECEIVER",
+            "peer_mac": "00:00:00:00:00:00",
+            "tx_id": 1
+        }
+    }
+}

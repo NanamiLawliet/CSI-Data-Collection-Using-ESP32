@@ -125,14 +125,14 @@ class CsiLogViewer:
                                   font=("Consolas", 9, "bold"))
         self.rec_label.pack(side=tk.LEFT, padx=4)
 
-        tk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
         # ── viewer section ──
         btn("Open CSV",       self._open_file,      "#457b9d").pack(side=tk.LEFT, padx=3)
         btn("Latest Session", self._open_latest,    "#7D8CA3").pack(side=tk.LEFT, padx=3)
         btn("Clear View",     self._clear_display,  "#59544B").pack(side=tk.LEFT, padx=3)
 
-        tk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
         self.auto_scroll = tk.BooleanVar(value=True)
         tk.Checkbutton(bar, text="Auto-scroll", variable=self.auto_scroll,

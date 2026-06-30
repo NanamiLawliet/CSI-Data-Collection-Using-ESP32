@@ -19,48 +19,39 @@ Navigate: `Component config` → `Wi-Fi` → ✅ `Enable CSI` → Save & Exit
 
 ---
 
-### Step 2: Build for TRANSMITTER (COM9)
+### Step 2: Build & Flash Generic Firmware to All Boards
 
-**1a. Edit main/main.c line 17:**
-```c
-#define DEVICE_ROLE_TRANSMITTER 1   // TX mode
-```
+With our new dynamic configuration system, you flash the **same generic firmware** to all your ESP32 boards once. They will start in `IDLE` mode and can be dynamically assigned roles (Transmitters or Receivers) via our central control GUI!
 
-**1b. Build & Flash:**
+**1a. Build the firmware:**
 ```bash
 idf.py set-target esp32
 idf.py build
-idf.py -p COM9 erase_flash
-idf.py -p COM9 flash
 ```
 
-**1c. Verify TX is Running:**
+**1b. Flash the firmware to all connected boards:**
+Identify your boards' COM ports and flash them (e.g. COM9 and COM10):
 ```bash
-idf.py -p COM9 monitor
-# Look for: "TX packet X sent" messages
+idf.py -p COM9 flash
+idf.py -p COM10 flash
 ```
 
 ---
 
-### Step 3: Build for RECEIVER (COM10)
+### Step 3: Assign Roles Using Central Control Interface
 
-**2a. Edit main/main.c line 17:**
-```c
-#define DEVICE_ROLE_TRANSMITTER 0   // RX mode
-```
+We use a Python Tkinter GUI to discover ESP32s and dynamically configure them as Transmitters or Receivers.
 
-**2b. Build & Flash:**
+**2a. Launch the Central Control GUI:**
 ```bash
-idf.py build
-idf.py -p COM10 erase_flash
-idf.py -p COM10 flash
+python central_control.py
 ```
 
-**2c. Verify RX is Receiving:**
-```bash
-idf.py -p COM10 monitor
-# Look for: "CSI_DATA,..." lines with RSSI values
-```
+**2b. Assign Roles in the Interface:**
+1. The GUI automatically scans the COM ports (identifying Silicon Labs USB serial drivers) and listens to UDP network broadcasts on port `3333`.
+2. Select your first device from the table and choose **RECEIVER** from the dropdown, then click **Apply Configuration**. The board will save this configuration to NVS and restart in Receiver mode.
+3. Select your second device, choose **TRANSMITTER**, select the first device's MAC from the target peer dropdown, choose a Transmitter ID (e.g., `1`), and click **Apply Configuration**. The board will restart in Transmitter mode.
+4. Verify roles are updated and active in the GUI table. All configuration is stored locally in `config.json` and persisted on the boards across reboots!
 
 ---
 
