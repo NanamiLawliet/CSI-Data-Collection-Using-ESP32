@@ -278,22 +278,42 @@ class CentralControlApp:
 
     def query_device_via_serial(self, port_name, verbose=False):
         try:
-            with serial.Serial(port_name, 115200, timeout=1.0, dsrdtr=False, rtscts=False) as ser:
+            with serial.Serial(port_name, 115200, timeout=0.5, dsrdtr=False, rtscts=False) as ser:
                 ser.dtr = False
                 ser.rts = False
-                # Wait 1.2 seconds for the ESP32 to finish bootloader phase in case RTS/DTR reset triggered
-                time.sleep(1.2)
-                ser.reset_input_buffer()  # Flush bootloader log output
+                # Wait 1.0 second for initial boot phase
+                time.sleep(1.0)
+                ser.reset_input_buffer()
+                
+                # Write command initially
                 ser.write(b"GET_STATUS\n")
-                time.sleep(0.2)
-                for _ in range(10):
-                    line = ser.readline().decode('utf-8', errors='ignore').strip()
-                    if "Silikonlabs:ESP32" in line or "STATUS:Silikonlabs:ESP32" in line:
-                        idx = line.find("Silikonlabs:ESP32")
-                        if idx != -1:
-                            status_line = line[idx:]
-                            self.parse_and_update_device(status_line, port_name)
-                            return
+                
+                start_time = time.time()
+                last_write = start_time
+                
+                # Loop for up to 2.5 seconds, retrying the command if no status is received
+                while time.time() - start_time < 2.5:
+                    if time.time() - last_write > 0.8:
+                        try:
+                            ser.write(b"GET_STATUS\n")
+                        except Exception:
+                            pass
+                        last_write = time.time()
+                    
+                    if ser.in_waiting > 0:
+                        try:
+                            line = ser.readline().decode('utf-8', errors='ignore').strip()
+                        except Exception:
+                            line = ""
+                        if "Silikonlabs:ESP32" in line or "STATUS:Silikonlabs:ESP32" in line:
+                            idx = line.find("Silikonlabs:ESP32")
+                            if idx != -1:
+                                status_line = line[idx:]
+                                self.parse_and_update_device(status_line, port_name)
+                                return
+                    else:
+                        time.sleep(0.02)
+                        
                 if verbose:
                     self.log_message(f"COM port {port_name} opened but did not reply to GET_STATUS.")
         except Exception as e:
@@ -413,8 +433,13 @@ class CentralControlApp:
             for item in self.tree.get_children():
                 self.tree.delete(item)
 
+            # Sort devices logically by their COM port numbers (COM3, COM4, etc.)
+            sorted_devices = sorted(
+                self.devices.items(),
+                key=lambda x: int(re.search(r'\d+', x[1].get('com_port', '0')).group() if re.search(r'\d+', x[1].get('com_port', '0')) else 0)
+            )
             current_time = time.time()
-            for mac, dev in self.devices.items():
+            for mac, dev in sorted_devices:
                 # If we haven't seen the device in 12 seconds, mark offline
                 is_offline = (current_time - dev['last_seen']) > 12
                 status_str = "Offline" if is_offline else "Online"
