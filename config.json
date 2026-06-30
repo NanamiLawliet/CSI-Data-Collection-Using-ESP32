@@ -1,15 +1,39 @@
 {
     "devices": {
         "08:D1:F9:F6:7C:EC": {
-            "port": "COM9",
+            "port": "COM11",
             "role": "TRANSMITTER",
-            "peer_mac": "68:FE:71:0C:91:3C",
+            "peer_mac": "88:57:21:C0:81:B4",
             "tx_id": 1
         },
         "68:FE:71:0C:91:3C": {
-            "port": "COM11",
+            "port": "COM4",
+            "role": "TRANSMITTER",
+            "peer_mac": "88:57:21:C0:81:B4",
+            "tx_id": 1
+        },
+        "88:57:21:C0:81:B4": {
+            "port": "COM9",
             "role": "RECEIVER",
             "peer_mac": "00:00:00:00:00:00",
+            "tx_id": 1
+        },
+        "88:57:21:C0:34:50": {
+            "port": "COM5",
+            "role": "TRANSMITTER",
+            "peer_mac": "88:57:21:C0:81:B4",
+            "tx_id": 1
+        },
+        "88:57:21:BF:44:60": {
+            "port": "COM3",
+            "role": "TRANSMITTER",
+            "peer_mac": "88:57:21:C0:81:B4",
+            "tx_id": 1
+        },
+        "68:FE:71:0B:A4:00": {
+            "port": "COM10",
+            "role": "TRANSMITTER",
+            "peer_mac": "88:57:21:C0:81:B4",
             "tx_id": 1
         }
     }
