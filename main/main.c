@@ -18,6 +18,7 @@
 #include <lwip/netdb.h>
 #include "driver/uart.h"
 #include "esp_vfs_dev.h"
+#include "esp_timer.h"
 
 #define ESPNOW_CHANNEL        1
 #define ESPNOW_TX_POWER_DBM   78
