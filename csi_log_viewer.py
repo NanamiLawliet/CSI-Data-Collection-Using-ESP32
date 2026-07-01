@@ -30,6 +30,8 @@ except ImportError:
 SESSIONS_DIR   = "sessions"
 POLL_MS        = 400
 MAX_ROWS       = 20_000
+UI_MAX_ROWS    = 1000  # Maximum number of lines shown in the live UI text box
+MAX_PACKETS_PER_FILE = 1_000_000  # Max packets per CSV file before automatic rotation
 GROUP_WINDOW_MS = 50   # must match firmware SEND_INTERVAL_MS
 
 CSI_REGEX = re.compile(r'CSI_START(\{.+\})CSI_END')
@@ -79,6 +81,12 @@ class CsiLogViewer:
         self.session_dir   = None
         self.session_start = None
         self.pkt_count     = 0
+
+        # rotation / thread safety
+        self.file_lock     = threading.Lock()
+        self.rotation_pending = False
+        self.current_file_date = None
+        self.current_file_packets = 0
 
         # viewer state
         self.csv_path: str | None = None
@@ -243,6 +251,9 @@ class CsiLogViewer:
 
         self.session_start = time.time()
         self.pkt_count = 0
+        self.current_file_date = datetime.datetime.now().date()
+        self.current_file_packets = 0
+        self.rotation_pending = False
         self.serial_running = True
 
         self.btn_connect.config(text="⏹  Stop", bg="#27ae60")
@@ -270,6 +281,32 @@ class CsiLogViewer:
         self.btn_connect.config(text="⏺  Record", bg="#c0392b")
         self.rec_label.config(text="")
         self.status_var.set(f"Stopped. {self.pkt_count} CSI frames written.")
+
+    def _rotate_csv(self):
+        with self.file_lock:
+            try:
+                if self.csv_file:
+                    self.csv_file.close()
+            except Exception:
+                pass
+            
+            ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            csv_path = os.path.join(self.session_dir, f"csi_data_{ts}.csv")
+            
+            try:
+                self.csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
+                self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=FIELDNAMES)
+                self.csv_writer.writeheader()
+                self.csv_file.flush()
+                
+                self.csv_path = csv_path
+                self.current_file_date = datetime.datetime.now().date()
+                self.current_file_packets = 0
+                self.rotation_pending = True
+                
+                self.root.after(0, lambda p=csv_path: self.status_var.set(f"Recording (Rotated) → {os.path.relpath(p)}"))
+            except Exception as e:
+                self.root.after(0, lambda msg=str(e): self.status_var.set(f"Rotation Error: {msg}"))
 
     def _blink_rec(self):
         if not self.serial_running:
@@ -305,6 +342,11 @@ class CsiLogViewer:
         if data_length <= 0:
             return
 
+        # Check for rotation
+        current_date = datetime.datetime.now().date()
+        if (current_date != self.current_file_date) or (self.current_file_packets >= MAX_PACKETS_PER_FILE):
+            self._rotate_csv()
+
         tx_id     = int(pkt.get('tx_id', 0))
         esp_ts_us = int(pkt.get('esp_timestamp', 0))
         group_id  = int((esp_ts_us / 1000) / GROUP_WINDOW_MS)
@@ -324,10 +366,15 @@ class CsiLogViewer:
             'csi_data':     json.dumps(csi_data),
             'seq':          '',
         }
-        if self.csv_writer:
-            self.csv_writer.writerow(row)
-            self.csv_file.flush()
-            self.pkt_count += 1
+        with self.file_lock:
+            if self.csv_writer:
+                try:
+                    self.csv_writer.writerow(row)
+                    self.csv_file.flush()
+                    self.pkt_count += 1
+                    self.current_file_packets += 1
+                except Exception:
+                    pass
 
     # ── CSV viewer (tail) ─────────────────────────────────────────────────────
 
@@ -349,10 +396,12 @@ class CsiLogViewer:
 
     def _load(self, path: str):
         self._stop_poll()
-        self.csv_path    = path
-        self.file_pos    = 0
-        self.header_read = False
-        self.fn_detected = None
+        with self.file_lock:
+            self.csv_path    = path
+            self.file_pos    = 0
+            self.header_read = False
+            self.fn_detected = None
+            self.rotation_pending = False
         self.all_rows.clear()
         self._clear_display()
         self._insert_header()
@@ -366,17 +415,26 @@ class CsiLogViewer:
             return []
         rows = []
         try:
-            fsize = os.path.getsize(self.csv_path)
-            if fsize <= self.file_pos:
-                return []
-            with open(self.csv_path, 'rb') as f:
-                f.seek(self.file_pos)
-                raw = f.read()
+            with self.file_lock:
+                if self.rotation_pending:
+                    self.file_pos = 0
+                    self.header_read = False
+                    self.rotation_pending = False
+                
+                fsize = os.path.getsize(self.csv_path)
+                if fsize <= self.file_pos:
+                    return []
+                with open(self.csv_path, 'rb') as f:
+                    f.seek(self.file_pos)
+                    raw = f.read()
+            
             last_nl = raw.rfind(b'\n')
             if last_nl == -1:
                 return []
             raw = raw[:last_nl + 1]
-            self.file_pos += len(raw)
+            with self.file_lock:
+                self.file_pos += len(raw)
+            
             text = raw.decode('utf-8', errors='ignore')
             lines = text.splitlines()
             if not lines:
@@ -448,6 +506,17 @@ class CsiLogViewer:
                 grp = 0
             tag = "group_even" if (grp % 2 == 0) else "group_odd"
             self.text.insert(tk.END, self._fmt_row(row), tag)
+        
+        # Enforce UI limit (keep last UI_MAX_ROWS rows + 2 header lines)
+        try:
+            total_lines = int(self.text.index('end-1c').split('.')[0])
+            max_lines_limit = UI_MAX_ROWS + 2
+            if total_lines > max_lines_limit:
+                excess = total_lines - max_lines_limit
+                self.text.delete("3.0", f"{3.0 + excess}.0")
+        except Exception:
+            pass
+
         self.text.config(state=tk.DISABLED)
         if self.auto_scroll.get():
             self.text.see(tk.END)

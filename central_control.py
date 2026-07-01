@@ -244,7 +244,7 @@ class CentralControlApp:
 
     # ── Serial Port Scanning ──────────────────────────────────────────────────
     def trigger_manual_scan(self):
-        self.log_message("Triggering manual COM port scan...")
+        self.log_message("Triggering manual serial port scan...")
         threading.Thread(target=self.scan_serial_ports, args=(True,), daemon=True).start()
 
     def periodic_serial_scan(self):
@@ -264,7 +264,15 @@ class CentralControlApp:
                 
                 # Broaden keywords to catch CH340, FTDI, Espressif native USB, and generic USB serial bridges
                 keywords = ["Silicon", "CP210", "WCH", "CH34", "USB Serial", "USB-Serial", "Espressif", "FTDI"]
-                if any(kw.lower() in desc.lower() or kw.lower() in mfg.lower() for kw in keywords):
+                is_usb_serial = any(kw.lower() in desc.lower() or kw.lower() in mfg.lower() for kw in keywords)
+                
+                # Fallback for Linux/macOS where description or manufacturer details might be empty or generic
+                if not is_usb_serial:
+                    dev_lower = p.device.lower()
+                    if any(term in dev_lower for term in ["ttyusb", "ttyacm", "usbserial", "usbmodem"]):
+                        is_usb_serial = True
+                
+                if is_usb_serial:
                     port_name = p.device
                     threading.Thread(target=self.query_device_via_serial, args=(port_name, verbose), daemon=True).start()
             
@@ -315,7 +323,13 @@ class CentralControlApp:
                         time.sleep(0.02)
                         
                 if verbose:
-                    self.log_message(f"COM port {port_name} opened but did not reply to GET_STATUS.")
+                    self.log_message(f"Port {port_name} opened but did not reply to GET_STATUS.")
+        except serial.SerialException as e:
+            err_msg = str(e)
+            if "permission denied" in err_msg.lower() or "permissionerror" in err_msg.lower():
+                self.log_message(f"Permission denied on {port_name}. Run: 'sudo usermod -aG dialout $USER' and restart system/logout.")
+            elif verbose:
+                self.log_message(f"Could not open port {port_name}: {err_msg}")
         except Exception as e:
             if verbose:
                 self.log_message(f"Could not open port {port_name}: {str(e)}")
@@ -433,10 +447,15 @@ class CentralControlApp:
             for item in self.tree.get_children():
                 self.tree.delete(item)
 
-            # Sort devices logically by their COM port numbers (COM3, COM4, etc.)
+            # Sort devices logically by their port numbers (COM3, COM4, /dev/ttyUSB0, /dev/ttyACM1, etc.)
+            def port_sort_key(item):
+                port = item[1].get('com_port', '')
+                numbers = re.findall(r'\d+', port)
+                return int(numbers[-1]) if numbers else 0
+
             sorted_devices = sorted(
                 self.devices.items(),
-                key=lambda x: int(re.search(r'\d+', x[1].get('com_port', '0')).group() if re.search(r'\d+', x[1].get('com_port', '0')) else 0)
+                key=port_sort_key
             )
             current_time = time.time()
             for mac, dev in sorted_devices:
