@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <assert.h>
+#include "esp_idf_version.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -58,8 +60,6 @@ static uint8_t s_current_role = 0; // 0=IDLE, 1=TRANSMITTER, 2=RECEIVER
 static uint8_t s_peer_mac[6] = {0};
 static uint8_t s_tx_id = 1;
 
-static bool s_wifi_connected = false;
-static char s_ip_addr[16] = "0.0.0.0";
 static int64_t s_mute_csi_until = 0; // Temp silent window for UART queries
 
 // ── Dynamic Transmitter Mapping (For Receiver CSI Logs) ──────────────────────
@@ -314,7 +314,11 @@ static esp_err_t configure_espnow_peer_rate(const uint8_t *peer_mac)
 // ── TRANSMITTER Mode ──────────────────────────────────────────────────────────
 static sensor_payload_t s_current_payload = {0};
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
 static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
+#else
+static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
+#endif
 {
     ESP_LOGI("ESP_NOW_TX", "ESP-NOW status = %s",
              status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
@@ -351,8 +355,17 @@ static volatile uint32_t csi_tx1_count        = 0;
 static volatile uint32_t csi_tx2_count        = 0;
 static volatile uint32_t csi_tx3_count        = 0;
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 static void espnow_recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int len)
 {
+    const uint8_t *src_mac = esp_now_info->src_addr;
+    int rssi = esp_now_info && esp_now_info->rx_ctrl ? esp_now_info->rx_ctrl->rssi : 0;
+#else
+static void espnow_recv_cb(const uint8_t *mac_addr, const uint8_t *data, int len)
+{
+    const uint8_t *src_mac = mac_addr;
+    int rssi = 0;
+#endif
     if (data == NULL || len < SENSOR_PAYLOAD_HEADER_LEN) {
         ESP_LOGW("ESP_NOW_RX", "Gelen veri gecersiz veya cok kisa: %d", len);
         return;
@@ -361,9 +374,8 @@ static void espnow_recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_
     const sensor_payload_t *payload = (const sensor_payload_t *)data;
 
     // Dynamically register or update transmitter mapping based on incoming ESP-NOW message
-    update_transmitter_map(esp_now_info->src_addr, payload->tx_id);
+    update_transmitter_map(src_mac, payload->tx_id);
 
-    int rssi = esp_now_info && esp_now_info->rx_ctrl ? esp_now_info->rx_ctrl->rssi : 0;
     ESP_LOGI("ESP_NOW_RX", "Gelen paket: seq=%" PRIu32 " tx_id=%u rssi=%d",
              payload->seq,
              payload->tx_id,
@@ -531,7 +543,11 @@ void app_main(void)
     // Install UART driver on UART_NUM_0 at the absolute start of boot
     uart_driver_install(UART_NUM_0, 256 * 2, 0, 0, NULL, 0);
     uart_param_config(UART_NUM_0, &uart_config);
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+    uart_vfs_dev_use_driver(0);
+#else
     esp_vfs_dev_uart_use_driver(0);
+#endif
 
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
