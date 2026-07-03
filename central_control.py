@@ -197,7 +197,7 @@ class CentralControlApp:
             print(f"Error saving config.json: {e}")
 
     # ── Device Data Processing ────────────────────────────────────────────────
-    def parse_and_update_device(self, msg, com_port):
+    def parse_and_update_device(self, msg, com_port, baud_rate=2000000):
         match = STATUS_REGEX.match(msg)
         if match:
             mac = match.group(1).upper()
@@ -213,15 +213,17 @@ class CentralControlApp:
                     'role': role,
                     'peer_mac': peer_mac,
                     'tx_id': tx_id,
-                    'last_seen': time.time()
+                    'last_seen': time.time(),
+                    'baud_rate': baud_rate
                 }
-                self.log_message(f"Discovered device: MAC {mac} on COM port {com_port}")
+                self.log_message(f"Discovered device: MAC {mac} on COM port {com_port} ({baud_rate} baud)")
             else:
                 self.devices[mac]['com_port'] = com_port
                 self.devices[mac]['role'] = role
                 self.devices[mac]['peer_mac'] = peer_mac
                 self.devices[mac]['tx_id'] = tx_id
                 self.devices[mac]['last_seen'] = time.time()
+                self.devices[mac]['baud_rate'] = baud_rate
 
             # Keep config_mappings up to date
             if mac not in self.config_mappings:
@@ -285,60 +287,62 @@ class CentralControlApp:
             print(f"Serial port scan error: {e}")
 
     def query_device_via_serial(self, port_name, verbose=False):
-        try:
-            with serial.Serial(port_name, 2000000, timeout=0.5, dsrdtr=False, rtscts=False) as ser:
-                # Standard ESP32 reset sequence to boot into the application normally
-                ser.dtr = False
-                ser.rts = True
-                time.sleep(0.1)
-                ser.rts = False
-                time.sleep(0.05)
-                ser.dtr = False
-                
-                # Wait 1.5 seconds for initial boot phase
-                time.sleep(1.5)
-                ser.reset_input_buffer()
-                
-                # Write command initially
-                ser.write(b"GET_STATUS\n")
-                
-                start_time = time.time()
-                last_write = start_time
-                
-                # Loop for up to 2.5 seconds, retrying the command if no status is received
-                while time.time() - start_time < 2.5:
-                    if time.time() - last_write > 0.8:
-                        try:
-                            ser.write(b"GET_STATUS\n")
-                        except Exception:
-                            pass
-                        last_write = time.time()
+        for baud in [2000000, 115200]:
+            try:
+                with serial.Serial(port_name, baud, timeout=0.5, dsrdtr=False, rtscts=False) as ser:
+                    # Standard ESP32 reset sequence to boot into the application normally
+                    ser.dtr = False
+                    ser.rts = True
+                    time.sleep(0.1)
+                    ser.rts = False
+                    time.sleep(0.05)
+                    ser.dtr = False
                     
-                    if ser.in_waiting > 0:
-                        try:
-                            line = ser.readline().decode('utf-8', errors='ignore').strip()
-                        except Exception:
-                            line = ""
-                        if "Silikonlabs:ESP32" in line or "STATUS:Silikonlabs:ESP32" in line:
-                            idx = line.find("Silikonlabs:ESP32")
-                            if idx != -1:
-                                status_line = line[idx:]
-                                self.parse_and_update_device(status_line, port_name)
-                                return
-                    else:
-                        time.sleep(0.02)
+                    # Wait 1.5 seconds for initial boot phase
+                    time.sleep(1.5)
+                    ser.reset_input_buffer()
+                    
+                    # Write command initially
+                    ser.write(b"GET_STATUS\n")
+                    
+                    start_time = time.time()
+                    last_write = start_time
+                    
+                    # Loop for up to 1.5 seconds per baud rate, retrying the command if no status is received
+                    while time.time() - start_time < 1.5:
+                        if time.time() - last_write > 0.5:
+                            try:
+                                ser.write(b"GET_STATUS\n")
+                            except Exception:
+                                pass
+                            last_write = time.time()
                         
-                if verbose:
-                    self.log_message(f"Port {port_name} opened but did not reply to GET_STATUS.")
-        except serial.SerialException as e:
-            err_msg = str(e)
-            if "permission denied" in err_msg.lower() or "permissionerror" in err_msg.lower():
-                self.log_message(f"Permission denied on {port_name}. Run: 'sudo usermod -aG dialout $USER' and restart system/logout.")
-            elif verbose:
-                self.log_message(f"Could not open port {port_name}: {err_msg}")
-        except Exception as e:
-            if verbose:
-                self.log_message(f"Could not open port {port_name}: {str(e)}")
+                        if ser.in_waiting > 0:
+                            try:
+                                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                            except Exception:
+                                line = ""
+                            if "Silikonlabs:ESP32" in line or "STATUS:Silikonlabs:ESP32" in line:
+                                idx = line.find("Silikonlabs:ESP32")
+                                if idx != -1:
+                                    status_line = line[idx:]
+                                    self.parse_and_update_device(status_line, port_name, baud)
+                                    return
+                        else:
+                            time.sleep(0.02)
+            except serial.SerialException as e:
+                err_msg = str(e)
+                if "permission denied" in err_msg.lower() or "permissionerror" in err_msg.lower():
+                    self.log_message(f"Permission denied on {port_name}. Run: 'sudo usermod -aG dialout $USER' and restart system/logout.")
+                    return
+                elif verbose and baud == 115200:
+                    self.log_message(f"Could not open port {port_name}: {err_msg}")
+            except Exception as e:
+                if verbose and baud == 115200:
+                    self.log_message(f"Could not open port {port_name}: {str(e)}")
+        
+        if verbose:
+            self.log_message(f"Port {port_name} opened but did not reply to GET_STATUS at 2000000 or 115200 baud.")
 
     # ── UI Event Callbacks ────────────────────────────────────────────────────
     def on_device_selected(self, event):
@@ -413,10 +417,11 @@ class CentralControlApp:
         com = dev.get('com_port', '')
 
         # Send via Serial
+        baud = dev.get('baud_rate', 2000000)
         if com:
-            self.log_message(f"Attempting to write command over Serial ({com})...")
+            self.log_message(f"Attempting to write command over Serial ({com}) at {baud} baud...")
             try:
-                with serial.Serial(com, 2000000, timeout=1.0, dsrdtr=False, rtscts=False) as ser:
+                with serial.Serial(com, baud, timeout=1.0, dsrdtr=False, rtscts=False) as ser:
                     # Standard ESP32 reset sequence to boot into the application normally
                     ser.dtr = False
                     ser.rts = True
