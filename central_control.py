@@ -287,10 +287,16 @@ class CentralControlApp:
     def query_device_via_serial(self, port_name, verbose=False):
         try:
             with serial.Serial(port_name, 2000000, timeout=0.5, dsrdtr=False, rtscts=False) as ser:
+                # Standard ESP32 reset sequence to boot into the application normally
                 ser.dtr = False
+                ser.rts = True
+                time.sleep(0.1)
                 ser.rts = False
-                # Wait 1.0 second for initial boot phase
-                time.sleep(1.0)
+                time.sleep(0.05)
+                ser.dtr = False
+                
+                # Wait 1.5 seconds for initial boot phase
+                time.sleep(1.5)
                 ser.reset_input_buffer()
                 
                 # Write command initially
@@ -411,10 +417,16 @@ class CentralControlApp:
             self.log_message(f"Attempting to write command over Serial ({com})...")
             try:
                 with serial.Serial(com, 2000000, timeout=1.0, dsrdtr=False, rtscts=False) as ser:
+                    # Standard ESP32 reset sequence to boot into the application normally
                     ser.dtr = False
+                    ser.rts = True
+                    time.sleep(0.1)
                     ser.rts = False
-                    # Wait 1.2 seconds for the ESP32 to boot up after hardware reset
-                    time.sleep(1.2)
+                    time.sleep(0.05)
+                    ser.dtr = False
+                    
+                    # Wait 1.5 seconds for the ESP32 to boot up after hardware reset
+                    time.sleep(1.5)
                     ser.reset_input_buffer()
                     ser.write(f"{cmd}\n".encode())
                     time.sleep(0.2)

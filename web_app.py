@@ -67,7 +67,16 @@ class ESPNOWDataLogger:
 
     def connect(self):
         try:
-            self.serial_conn = serial.Serial(self.port, self.baud_rate, timeout=1)
+            self.serial_conn = serial.Serial(self.port, self.baud_rate, timeout=1, dsrdtr=False, rtscts=False)
+            # Standard ESP32 reset sequence to boot into the application normally
+            self.serial_conn.dtr = False
+            self.serial_conn.rts = True
+            time.sleep(0.1)
+            self.serial_conn.rts = False
+            time.sleep(0.05)
+            self.serial_conn.dtr = False
+            # Wait for boot phase to complete
+            time.sleep(1.5)
             print(f"Connected to ESP32 on {self.port}")
             return True
         except serial.SerialException as e:

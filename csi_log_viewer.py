@@ -232,7 +232,16 @@ class CsiLogViewer:
             return
         port = self.port_var.get().strip()
         try:
-            self.serial_conn = serial.Serial(port, 2000000, timeout=1)
+            self.serial_conn = serial.Serial(port, 2000000, timeout=1, dsrdtr=False, rtscts=False)
+            # Standard ESP32 reset sequence to boot into the application normally
+            self.serial_conn.dtr = False
+            self.serial_conn.rts = True
+            time.sleep(0.1)
+            self.serial_conn.rts = False
+            time.sleep(0.05)
+            self.serial_conn.dtr = False
+            # Wait for boot phase to complete
+            time.sleep(1.5)
         except Exception as e:
             self.status_var.set(f"Serial error: {e}")
             return
