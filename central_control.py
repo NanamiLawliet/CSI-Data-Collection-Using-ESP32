@@ -16,11 +16,11 @@ import re
 
 CONFIG_FILE = "config.json"
 
-# Regex to match the status advertisement on Serial Console
-# E.g.: STATUS:Silikonlabs:ESP32:MAC:08:D1:F9:F6:7C:EC:IP:0.0.0.0:ROLE:IDLE:PEER:00:00:00:00:00:00:TXID:1
 STATUS_REGEX = re.compile(
-    r'(?:STATUS:)?Silikonlabs:ESP32:MAC:([0-9a-fA-F:]{17}):IP:([0-9.]+):ROLE:([A-Z_]+):PEER:([0-9a-fA-F:]{17}):TXID:(\d+)'
+    r'(?<![0-9a-zA-Z])([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})(?!:[0-9a-fA-F]).*?(RECEIVER|TRANSMITTER|IDLE)'
 )
+PEER_REGEX = re.compile(r'P?E?E?R?:?(?<![0-9a-zA-Z])([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})(?!:[0-9a-fA-F])')
+TXID_REGEX = re.compile(r'T?X?I?D?:?(\d+)\s*$')
 
 class CentralControlApp:
     def __init__(self, root):
@@ -73,8 +73,11 @@ class CentralControlApp:
 
         # Run states
         self.running = True
+        self.port_locks = {}
+        self.port_locks_mutex = threading.Lock()
 
         self._build_ui()
+        self.update_peer_combobox()
 
         # Start periodic serial scanner thread
         self.serial_thread = threading.Thread(target=self.periodic_serial_scan, daemon=True)
@@ -186,6 +189,9 @@ class CentralControlApp:
                 with open(CONFIG_FILE, 'r') as f:
                     data = json.load(f)
                     self.config_mappings = data.get("devices", {})
+                    for mac, cfg in self.config_mappings.items():
+                        if cfg.get("peer_mac", "").upper() == mac.upper():
+                            cfg["peer_mac"] = "00:00:00:00:00:00"
             except Exception as e:
                 print(f"Error loading config.json: {e}")
 
@@ -197,13 +203,26 @@ class CentralControlApp:
             print(f"Error saving config.json: {e}")
 
     # ── Device Data Processing ────────────────────────────────────────────────
-    def parse_and_update_device(self, msg, com_port, baud_rate=2000000):
-        match = STATUS_REGEX.match(msg)
+    def parse_and_update_device(self, msg, com_port, baud_rate=921600):
+        match = STATUS_REGEX.search(msg)
         if match:
             mac = match.group(1).upper()
-            role = match.group(3)
-            peer_mac = match.group(4).upper()
-            tx_id = int(match.group(5))
+            role = match.group(2)
+            saved = self.config_mappings.get(mac, {})
+
+            if role in ("RECEIVER", "IDLE"):
+                peer_mac = "00:00:00:00:00:00"
+            else:
+                after_role = msg[match.end():]
+                peer_match = PEER_REGEX.search(after_role)
+                peer_mac = peer_match.group(1).upper() if peer_match else saved.get('peer_mac', "00:00:00:00:00:00")
+                if peer_mac == mac:
+                    peer_mac = saved.get('peer_mac', "00:00:00:00:00:00")
+                    if peer_mac == mac:
+                        peer_mac = "00:00:00:00:00:00"
+
+            txid_match = TXID_REGEX.search(msg[match.end():])
+            tx_id = int(txid_match.group(1)) if txid_match else int(saved.get('tx_id', 1))
 
             # Update or insert
             if mac not in self.devices:
@@ -236,11 +255,24 @@ class CentralControlApp:
 
             # Update receiver MAC list in peer combobox dynamically
             self.update_peer_combobox()
+            return True
+        return False
 
     def update_peer_combobox(self):
         receivers = []
+        # 1. Active discovered devices with RECEIVER or IDLE role (excluding currently selected device)
         for mac, dev in self.devices.items():
-            if dev['role'] == 'RECEIVER' or dev['role'] == 'IDLE':
+            if mac != self.selected_mac and dev.get('role') in ('RECEIVER', 'IDLE'):
+                if mac not in receivers:
+                    receivers.append(mac)
+        # 2. Known RECEIVER or IDLE devices from config.json (excluding currently selected device)
+        for mac, cfg in self.config_mappings.items():
+            if mac != self.selected_mac and cfg.get('role') in ('RECEIVER', 'IDLE'):
+                if mac not in receivers:
+                    receivers.append(mac)
+        # 3. Any other known device MACs as fallback (excluding currently selected device)
+        for mac in list(self.devices.keys()) + list(self.config_mappings.keys()):
+            if mac != self.selected_mac and mac not in receivers:
                 receivers.append(mac)
         self.cb_peer['values'] = receivers
 
@@ -286,63 +318,100 @@ class CentralControlApp:
         except Exception as e:
             print(f"Serial port scan error: {e}")
 
+    def _get_port_lock(self, port_name):
+        with self.port_locks_mutex:
+            if port_name not in self.port_locks:
+                self.port_locks[port_name] = threading.Lock()
+            return self.port_locks[port_name]
+
     def query_device_via_serial(self, port_name, verbose=False):
-        for baud in [2000000, 115200]:
-            try:
-                with serial.Serial(port_name, baud, timeout=0.5, dsrdtr=False, rtscts=False) as ser:
-                    # Standard ESP32 reset sequence to boot into the application normally
-                    ser.dtr = False
-                    ser.rts = True
-                    time.sleep(0.1)
-                    ser.rts = False
-                    time.sleep(0.05)
-                    ser.dtr = False
-                    
-                    # Wait 1.5 seconds for initial boot phase
-                    time.sleep(1.5)
-                    ser.reset_input_buffer()
-                    
-                    # Write command initially
-                    ser.write(b"GET_STATUS\n")
-                    
-                    start_time = time.time()
-                    last_write = start_time
-                    
-                    # Loop for up to 1.5 seconds per baud rate, retrying the command if no status is received
-                    while time.time() - start_time < 1.5:
-                        if time.time() - last_write > 0.5:
-                            try:
-                                ser.write(b"GET_STATUS\n")
-                            except Exception:
-                                pass
-                            last_write = time.time()
-                        
-                        if ser.in_waiting > 0:
-                            try:
-                                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                            except Exception:
-                                line = ""
-                            if "Silikonlabs:ESP32" in line or "STATUS:Silikonlabs:ESP32" in line:
-                                idx = line.find("Silikonlabs:ESP32")
-                                if idx != -1:
-                                    status_line = line[idx:]
-                                    self.parse_and_update_device(status_line, port_name, baud)
+        port_lock = self._get_port_lock(port_name)
+        if not port_lock.acquire(blocking=False):
+            if verbose:
+                self.log_message(f"Port {port_name} is currently being scanned, please wait...")
+            return
+
+        ser = None
+        try:
+            ser = serial.Serial()
+            ser.port = port_name
+            ser.baudrate = 115200
+            ser.timeout = 0.2
+            ser.write_timeout = 0.5
+            ser.dtr = False
+            ser.rts = False
+            ser.open()
+
+            for baud in [115200, 921600, 2000000]:
+                ser.baudrate = baud
+                time.sleep(0.05)
+                if ser.in_waiting > 0:
+                    try:
+                        ser.read(ser.in_waiting)
+                    except Exception:
+                        pass
+
+                # Query without resetting first (instant response if already booted),
+                # then keep polling up to 1.8s at this baud rate
+                ser.write(b"\r\nGET_STATUS\r\n")
+                start_time = time.time()
+                last_write = start_time
+                rx_buf = ""
+
+                while time.time() - start_time < 1.8:
+                    if time.time() - last_write > 0.25:
+                        try:
+                            ser.write(b"\r\nGET_STATUS\r\n")
+                        except Exception:
+                            pass
+                        last_write = time.time()
+
+                    waiting = ser.in_waiting
+                    if waiting > 0:
+                        try:
+                            chunk = ser.read(waiting).decode('utf-8', errors='ignore').replace('\x00', '')
+                            rx_buf += chunk
+                        except Exception:
+                            pass
+                        if "\n" in rx_buf:
+                            lines = rx_buf.splitlines()
+                            # Keep last incomplete line in rx_buf if buffer doesn't end with newline
+                            if not rx_buf.endswith(("\n", "\r")):
+                                rx_buf = lines.pop() if lines else ""
+                            else:
+                                rx_buf = ""
+                            for line in lines:
+                                line = line.strip()
+                                if line and self.parse_and_update_device(line, port_name, baud):
                                     return
-                        else:
-                            time.sleep(0.02)
-            except serial.SerialException as e:
-                err_msg = str(e)
-                if "permission denied" in err_msg.lower() or "permissionerror" in err_msg.lower():
+                    else:
+                        time.sleep(0.02)
+
+            if verbose:
+                self.log_message(f"Port {port_name} opened but did not reply to GET_STATUS at 115200, 921600, or 2000000 baud.")
+        except serial.SerialException as e:
+            err_msg = str(e)
+            if "permission denied" in err_msg.lower() or "permissionerror" in err_msg.lower():
+                if os.name == 'nt':
+                    self.log_message(
+                        f"Port {port_name} is busy / locked by another program (e.g. CSI Log Viewer, Web App, or VS Code Serial Monitor). "
+                        f"Close any other window using {port_name} and click 'Scan COM Ports Now'."
+                    )
+                else:
                     self.log_message(f"Permission denied on {port_name}. Run: 'sudo usermod -aG dialout $USER' and restart system/logout.")
-                    return
-                elif verbose and baud == 115200:
-                    self.log_message(f"Could not open port {port_name}: {err_msg}")
-            except Exception as e:
-                if verbose and baud == 115200:
-                    self.log_message(f"Could not open port {port_name}: {str(e)}")
-        
-        if verbose:
-            self.log_message(f"Port {port_name} opened but did not reply to GET_STATUS at 2000000 or 115200 baud.")
+                return
+            elif verbose:
+                self.log_message(f"Could not open port {port_name}: {err_msg}")
+        except Exception as e:
+            if verbose:
+                self.log_message(f"Could not open port {port_name}: {str(e)}")
+        finally:
+            if ser is not None and ser.is_open:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+            port_lock.release()
 
     # ── UI Event Callbacks ────────────────────────────────────────────────────
     def on_device_selected(self, event):
@@ -359,6 +428,7 @@ class CentralControlApp:
             return
             
         self.selected_mac = mac
+        self.update_peer_combobox()
         dev = self.devices.get(mac)
         if not dev:
             return
@@ -368,18 +438,23 @@ class CentralControlApp:
         # Load values to form
         current_role = dev.get('role', 'IDLE')
         self.role_var.set(current_role)
-        self.on_role_changed(None)
 
         peer_mac = dev.get('peer_mac', '')
-        if peer_mac == "00:00:00:00:00:00":
+        if peer_mac == "00:00:00:00:00:00" or peer_mac == mac:
             peer_mac = ""
         self.peer_var.set(peer_mac)
+        self.on_role_changed(None)
         
         self.tx_id_var.set(dev.get('tx_id', 1))
 
     def on_role_changed(self, event):
         role = self.role_var.get()
         if role == "TRANSMITTER":
+            self.update_peer_combobox()
+            current_peer = self.peer_var.get().strip()
+            available_peers = list(self.cb_peer['values'])
+            if (not current_peer or current_peer == self.selected_mac) and available_peers:
+                self.peer_var.set(available_peers[0])
             self.tx_options_frame.pack(fill=tk.X, pady=10)
         else:
             self.tx_options_frame.pack_forget()
@@ -399,10 +474,13 @@ class CentralControlApp:
         elif role == "RECEIVER":
             cmd = "SET_ROLE:RECEIVER"
         elif role == "TRANSMITTER":
-            peer = self.peer_var.get().strip()
+            peer = self.peer_var.get().strip().upper()
             tx_id = self.tx_id_var.get()
-            if not peer:
+            if not peer or peer == "00:00:00:00:00:00":
                 messagebox.showerror("Validation Error", "Transmitter mode requires a valid target Receiver MAC address.")
+                return
+            if peer == self.selected_mac:
+                messagebox.showerror("Validation Error", "Target Receiver MAC cannot be the device's own MAC address.")
                 return
             cmd = f"SET_ROLE:TRANSMITTER:{peer}:{tx_id}"
             
@@ -417,28 +495,40 @@ class CentralControlApp:
         com = dev.get('com_port', '')
 
         # Send via Serial
-        baud = dev.get('baud_rate', 2000000)
+        baud = dev.get('baud_rate', 115200)
         if com:
-            self.log_message(f"Attempting to write command over Serial ({com}) at {baud} baud...")
-            try:
-                with serial.Serial(com, baud, timeout=1.0, dsrdtr=False, rtscts=False) as ser:
-                    # Standard ESP32 reset sequence to boot into the application normally
+            port_lock = self._get_port_lock(com)
+            with port_lock:
+                self.log_message(f"Attempting to write command over Serial ({com}) at {baud} baud...")
+                ser = None
+                try:
+                    ser = serial.Serial()
+                    ser.port = com
+                    ser.baudrate = baud
+                    ser.timeout = 1.0
+                    ser.write_timeout = 0.5
                     ser.dtr = False
-                    ser.rts = True
-                    time.sleep(0.1)
                     ser.rts = False
-                    time.sleep(0.05)
-                    ser.dtr = False
-                    
-                    # Wait 1.5 seconds for the ESP32 to boot up after hardware reset
-                    time.sleep(1.5)
-                    ser.reset_input_buffer()
-                    ser.write(f"{cmd}\n".encode())
-                    time.sleep(0.2)
+                    ser.open()
+                    time.sleep(0.1)
+                    if ser.in_waiting > 0:
+                        try:
+                            ser.read(ser.in_waiting)
+                        except Exception:
+                            pass
+                    for _ in range(3):
+                        ser.write(f"\r\n{cmd}\r\n".encode())
+                        time.sleep(0.15)
                     success = True
                     self.log_message(f"Serial command dispatched to {com} successfully.")
-            except Exception as e:
-                self.log_message(f"Serial dispatch failed on {com}: {e}")
+                except Exception as e:
+                    self.log_message(f"Serial dispatch failed on {com}: {e}")
+                finally:
+                    if ser is not None and ser.is_open:
+                        try:
+                            ser.close()
+                        except Exception:
+                            pass
 
         if success:
             # Save role to local config mappings
@@ -452,6 +542,7 @@ class CentralControlApp:
                 self.config_mappings[mac]['peer_mac'] = dev['peer_mac'] = "00:00:00:00:00:00"
                 self.config_mappings[mac]['tx_id'] = dev['tx_id'] = 1
             self.save_local_config()
+            self.update_peer_combobox()
             
             self.root.after(0, lambda: messagebox.showinfo("Success", f"Configuration sent to device {mac}.\nIt will now restart in its new role."))
         else:
@@ -474,17 +565,16 @@ class CentralControlApp:
                 self.devices.items(),
                 key=port_sort_key
             )
-            current_time = time.time()
+            active_ports = {p.device for p in serial.tools.list_ports.comports()}
             for mac, dev in sorted_devices:
-                # If we haven't seen the device in 12 seconds, mark offline
-                is_offline = (current_time - dev['last_seen']) > 12
-                status_str = "Offline" if is_offline else "Online"
+                com_str = dev.get('com_port', '')
+                is_online = bool(com_str and com_str in active_ports)
+                status_str = "Online" if is_online else "Offline"
                 
                 peer_str = dev.get('peer_mac', '')
                 if peer_str == "00:00:00:00:00:00":
                     peer_str = "—"
                 
-                com_str = dev.get('com_port', '')
                 if not com_str:
                     com_str = "—"
 

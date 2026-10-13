@@ -1,0 +1,1673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 CSI Real-Time Monitor</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            --bg-base: #0f1117;
+            --bg-surface: #181b24;
+            --bg-elevated: #222634;
+            --bg-input: #12141c;
+            --border: #2c3244;
+            --border-focus: #3d7eff;
+            --text-main: #f1f3f9;
+            --text-muted: #8b94a8;
+            --text-dim: #5a6378;
+            
+            --accent-blue: #3b82f6;
+            --accent-blue-bg: rgba(59, 130, 246, 0.15);
+            --accent-green: #10b981;
+            --accent-green-bg: rgba(16, 185, 129, 0.15);
+            --accent-amber: #f59e0b;
+            --accent-amber-bg: rgba(245, 158, 11, 0.15);
+            --accent-red: #ef4444;
+            --accent-red-bg: rgba(239, 68, 68, 0.15);
+            --accent-purple: #8b5cf6;
+            --accent-cyan: #06b6d4;
+
+            --tx1: #3b82f6;
+            --tx2: #ec4899;
+            --tx3: #10b981;
+            --tx4: #f59e0b;
+            --tx5: #8b5cf6;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: var(--bg-base);
+            color: var(--text-main);
+            min-height: 100vh;
+            line-height: 1.5;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Top Navigation Header */
+        header {
+            background-color: var(--bg-surface);
+            border-bottom: 1px solid var(--border);
+            padding: 10px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 16px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .brand-area {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .brand-icon {
+            width: 34px;
+            height: 34px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #2563eb, #7c3aed);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 15px;
+            box-shadow: 0 2px 10px rgba(59, 130, 246, 0.3);
+        }
+
+        .brand-title {
+            font-size: 17px;
+            font-weight: 700;
+            letter-spacing: -0.3px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .version-badge {
+            font-size: 11px;
+            font-family: 'JetBrains Mono', monospace;
+            padding: 2px 7px;
+            border-radius: 4px;
+            background: var(--bg-elevated);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+        }
+
+        /* Controls in Navbar */
+        .header-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: var(--bg-input);
+            padding: 4px 8px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+        }
+
+        .control-group label {
+            font-size: 12px;
+            color: var(--text-muted);
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
+        select, input[type="text"] {
+            background: var(--bg-surface);
+            color: var(--text-main);
+            border: 1px solid var(--border);
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 13px;
+            font-family: 'JetBrains Mono', monospace;
+            outline: none;
+            cursor: pointer;
+            transition: border-color 0.15s;
+        }
+
+        select:focus, input[type="text"]:focus {
+            border-color: var(--border-focus);
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 7px 14px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            border: 1px solid transparent;
+            transition: all 0.15s ease;
+            font-family: 'Inter', sans-serif;
+            text-decoration: none;
+            white-space: nowrap;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
+
+        .btn-primary {
+            background-color: var(--accent-blue);
+            color: #ffffff;
+        }
+        .btn-primary:hover {
+            background-color: #2563eb;
+        }
+
+        .btn-danger {
+            background-color: var(--accent-red);
+            color: #ffffff;
+        }
+        .btn-danger:hover {
+            background-color: #dc2626;
+        }
+
+        .btn-record {
+            background-color: var(--bg-elevated);
+            color: var(--accent-red);
+            border: 1px solid rgba(239, 68, 68, 0.4);
+        }
+        .btn-record:hover {
+            background-color: rgba(239, 68, 68, 0.15);
+        }
+        .btn-record.recording {
+            background-color: var(--accent-red);
+            color: white;
+            border-color: var(--accent-red);
+            animation: pulse-red 2s infinite;
+        }
+
+        @keyframes pulse-red {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
+            70% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+
+        .btn-ghost {
+            background-color: transparent;
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+        }
+        .btn-ghost:hover {
+            background-color: var(--bg-elevated);
+            color: var(--text-main);
+        }
+
+        .btn-xs {
+            padding: 3px 8px;
+            font-size: 11px;
+            border-radius: 4px;
+        }
+
+        /* Status Pills */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 5px 12px;
+            border-radius: 9999px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--text-dim);
+        }
+
+        .dot.live {
+            background-color: var(--accent-green);
+            box-shadow: 0 0 8px var(--accent-green);
+            animation: blink 1.4s infinite;
+        }
+        .dot.waiting {
+            background-color: var(--accent-amber);
+        }
+        .dot.stopped {
+            background-color: var(--accent-red);
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* Main Container */
+        main {
+            flex: 1;
+            padding: 20px 24px;
+            max-width: 1720px;
+            width: 100%;
+            margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        /* Metrics Strip */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 14px;
+        }
+
+        .metric-card {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px 16px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .metric-card::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 3px;
+            height: 100%;
+            background-color: var(--border);
+        }
+
+        .metric-card.accent-blue::after { background-color: var(--accent-blue); }
+        .metric-card.accent-green::after { background-color: var(--accent-green); }
+        .metric-card.accent-amber::after { background-color: var(--accent-amber); }
+        .metric-card.accent-purple::after { background-color: var(--accent-purple); }
+
+        .metric-label {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 600;
+            color: var(--text-muted);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .metric-value {
+            font-size: 26px;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-main);
+            margin: 6px 0 2px 0;
+        }
+
+        .metric-sub {
+            font-size: 11px;
+            color: var(--text-dim);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* TX Cards Grid */
+        .tx-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 14px;
+        }
+
+        .tx-card {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            position: relative;
+        }
+
+        .tx-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 10px;
+        }
+
+        .tx-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 700;
+            font-size: 14px;
+        }
+
+        .tx-badge {
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            color: white;
+        }
+        .tx-badge.tx-1 { background-color: var(--tx1); }
+        .tx-badge.tx-2 { background-color: var(--tx2); }
+        .tx-badge.tx-3 { background-color: var(--tx3); }
+        .tx-badge.tx-4 { background-color: var(--tx4); }
+
+        .tx-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+        }
+
+        .tx-stat-item {
+            background: var(--bg-input);
+            border-radius: 6px;
+            padding: 8px 10px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .tx-stat-item .lbl {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-bottom: 2px;
+        }
+
+        .tx-stat-item .val {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 15px;
+            font-weight: 600;
+        }
+
+        .tx-meta {
+            font-size: 11px;
+            color: var(--text-dim);
+            font-family: 'JetBrains Mono', monospace;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        /* Charts Section */
+        .chart-section {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+
+        .chart-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 12px;
+        }
+
+        .chart-tabs {
+            display: flex;
+            gap: 6px;
+            background: var(--bg-input);
+            padding: 4px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+        }
+
+        .chart-tab-btn {
+            background: transparent;
+            color: var(--text-muted);
+            border: none;
+            padding: 6px 14px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .chart-tab-btn.active {
+            background: var(--bg-elevated);
+            color: var(--text-main);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        }
+
+        .chart-tools {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .chart-canvas-wrapper {
+            position: relative;
+            height: 380px;
+            width: 100%;
+        }
+
+        /* Fullscreen Chart View */
+        .chart-section.fullscreen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            width: 100vw;
+            height: 100vh;
+            max-width: 100vw;
+            max-height: 100vh;
+            z-index: 99999;
+            background: var(--bg-base);
+            border-radius: 0;
+            border: none;
+            padding: 16px 24px;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .chart-section.fullscreen .chart-canvas-wrapper {
+            flex: 1;
+            height: 100%;
+            min-height: 0;
+        }
+
+        /* Subcarrier selector bar */
+        .sc-toolbar {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .sc-actions {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 8px;
+            font-size: 12px;
+        }
+
+        .sc-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            max-height: 85px;
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+
+        .sc-chip {
+            background: var(--bg-surface);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+            padding: 2px 7px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-family: 'JetBrains Mono', monospace;
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.1s;
+        }
+
+        .sc-chip:hover {
+            border-color: var(--accent-blue);
+            color: var(--text-main);
+        }
+
+        .sc-chip.selected {
+            background: var(--accent-blue);
+            color: #ffffff;
+            border-color: var(--accent-blue);
+            font-weight: 600;
+        }
+
+        /* Secondary Row (Console & Sessions) */
+        .bottom-grid {
+            display: grid;
+            grid-template-columns: 1.5fr 1fr;
+            gap: 16px;
+        }
+
+        @media (max-width: 1100px) {
+            .bottom-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .panel-box {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            height: 340px;
+        }
+
+        .panel-header {
+            background: var(--bg-elevated);
+            padding: 10px 14px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .panel-title {
+            font-size: 13px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .terminal-content {
+            background: #0b0d13;
+            flex: 1;
+            padding: 10px 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .term-row {
+            display: flex;
+            gap: 8px;
+            word-break: break-all;
+            white-space: pre-wrap;
+        }
+
+        .term-ts {
+            color: var(--text-dim);
+            flex-shrink: 0;
+        }
+
+        .term-tag {
+            padding: 0 4px;
+            border-radius: 2px;
+            font-size: 10px;
+            font-weight: 600;
+            flex-shrink: 0;
+        }
+        .term-tag.csi    { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+        .term-tag.espnow { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+        .term-tag.diag   { background: rgba(139, 92, 246, 0.2); color: #a78bfa; }
+        .term-tag.warn   { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+        .term-tag.error  { background: rgba(239, 68, 68, 0.2); color: #f87171; }
+        .term-tag.info   { background: rgba(255, 255, 255, 0.1); color: var(--text-muted); }
+
+        .term-txt {
+            color: #d1d5db;
+        }
+
+        /* Recordings Table */
+        .recordings-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0;
+        }
+
+        .recordings-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+
+        .recordings-table th {
+            background: var(--bg-elevated);
+            color: var(--text-muted);
+            text-align: left;
+            padding: 8px 12px;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .recordings-table td {
+            padding: 8px 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+        }
+
+        .recordings-table tr:hover td {
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        /* Toast notifications */
+        #toast-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            z-index: 1000;
+        }
+
+        .toast {
+            background: var(--bg-elevated);
+            color: var(--text-main);
+            border: 1px solid var(--border);
+            border-left: 4px solid var(--accent-blue);
+            padding: 10px 16px;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            font-size: 13px;
+            animation: slideIn 0.2s ease-out;
+        }
+
+        .toast.error { border-left-color: var(--accent-red); }
+        .toast.success { border-left-color: var(--accent-green); }
+
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Header Navigation -->
+    <header>
+        <div class="brand-area">
+            <div class="brand-icon">CSI</div>
+            <div class="brand-title">
+                ESP32 CSI Monitor
+                <span class="version-badge">ESP-NOW Multi-TX</span>
+            </div>
+            <div id="status-badge" class="status-badge">
+                <span id="status-dot" class="dot stopped"></span>
+                <span id="status-text">Disconnected</span>
+            </div>
+        </div>
+
+        <div class="header-controls">
+            <!-- Port Selection -->
+            <div class="control-group">
+                <label for="port-select">Port:</label>
+                <select id="port-select">
+                    <option value="">Scanning...</option>
+                </select>
+                <button class="btn btn-ghost btn-xs" title="Rescan Serial Ports" onclick="loadPorts()">↻</button>
+            </div>
+
+            <!-- Baud Rate -->
+            <div class="control-group">
+                <label for="baud-select">Baud:</label>
+                <select id="baud-select">
+                    <option value="115200" selected>115200 (Default)</option>
+                    <option value="921600">921600 (Ultra Low Latency)</option>
+                    <option value="2000000">2000000 (High Speed)</option>
+                </select>
+            </div>
+
+            <!-- Connect / Disconnect -->
+            <button id="btn-connect" class="btn btn-primary" onclick="toggleConnect()">
+                Connect
+            </button>
+
+            <!-- Recording Control -->
+            <button id="btn-record" class="btn btn-record" onclick="toggleRecord()" disabled>
+                ⏺ Record CSV
+            </button>
+            <span id="rec-status-info" style="font-size:12px; font-family:'JetBrains Mono',monospace; color:var(--text-muted); display:none;"></span>
+        </div>
+    </header>
+
+    <main>
+        <!-- Top Metrics Strip -->
+        <section class="metrics-grid">
+            <div class="metric-card accent-blue">
+                <div class="metric-label">CSI Packet Rate</div>
+                <div id="m-csi-hz" class="metric-value">0.0 <span style="font-size:14px; font-weight:400; color:var(--text-muted)">Hz</span></div>
+                <div id="m-csi-total" class="metric-sub">0 total packets</div>
+            </div>
+
+            <div class="metric-card accent-green">
+                <div class="metric-label">Active Transmitters</div>
+                <div id="m-active-tx" class="metric-value">0</div>
+                <div id="m-role-guess" class="metric-sub">Board: Searching...</div>
+            </div>
+
+            <div class="metric-card accent-amber">
+                <div class="metric-label">UART Throughput</div>
+                <div id="m-uart-speed" class="metric-value">0 <span style="font-size:14px; font-weight:400; color:var(--text-muted)">B/s</span></div>
+                <div id="m-uart-load" class="metric-sub">Bus load: 0%</div>
+            </div>
+
+            <div class="metric-card accent-green">
+                <div class="metric-label">Stream Latency</div>
+                <div id="m-latency" class="metric-value">0.05 <span style="font-size:14px; font-weight:400; color:var(--text-muted)">s</span></div>
+                <div id="m-latency-sub" class="metric-sub">⚡ Real-time Sync: OK</div>
+            </div>
+
+            <div class="metric-card accent-purple">
+                <div class="metric-label">Receiver Diag</div>
+                <div id="m-diag-matches" class="metric-value">0 <span style="font-size:14px; font-weight:400; color:var(--text-muted)">matches</span></div>
+                <div id="m-diag-drops" class="metric-sub">Queue drops: 0</div>
+            </div>
+        </section>
+
+        <!-- Transmitter Cards Overview -->
+        <section>
+            <div id="tx-cards" class="tx-container">
+                <div style="grid-column: 1 / -1; text-align: center; padding: 24px; color: var(--text-dim); background: var(--bg-surface); border-radius: 8px; border: 1px dashed var(--border);">
+                    No transmitter data yet. Connect to the receiver ESP32 on COM port to stream frames.
+                </div>
+            </div>
+        </section>
+
+        <!-- Main Chart Section -->
+        <section class="chart-section">
+            <div class="chart-header">
+                <div class="chart-tabs">
+                    <button class="chart-tab-btn active" onclick="switchChartTab('subcarriers')">Subcarriers Time Series</button>
+                    <button class="chart-tab-btn" onclick="switchChartTab('spectrum')">Instant Spectrum (All 64 SC)</button>
+                    <button class="chart-tab-btn" onclick="switchChartTab('rssi')">RSSI History</button>
+                </div>
+
+                <div class="chart-tools">
+                    <div class="control-group">
+                        <label for="tx-filter">TX Filter:</label>
+                        <select id="tx-filter" onchange="renderCharts(true)">
+                            <option value="all">All Transmitters</option>
+                        </select>
+                    </div>
+
+                    <div class="control-group">
+                        <label for="time-window">Window:</label>
+                        <select id="time-window" onchange="onTimeWindowChange()">
+                            <option value="15">15s</option>
+                            <option value="30" selected>30s</option>
+                            <option value="60">60s</option>
+                            <option value="120">120s</option>
+                        </select>
+                    </div>
+
+                    <button id="btn-pause" class="btn btn-ghost btn-xs" onclick="togglePause()">⏸ Pause</button>
+                    <button class="btn btn-ghost btn-xs" onclick="clearData()">Clear</button>
+                    <button id="btn-fullscreen" class="btn btn-ghost btn-xs" onclick="toggleFullscreen()" title="Tam Ekran (Kısayol: F / Esc)"><span id="fs-icon">⛶</span> <span id="fs-text">Tam Ekran</span></button>
+                </div>
+            </div>
+
+            <!-- Subcarrier Chips Toolbar (Visible when 'subcarriers' tab is active) -->
+            <div id="sc-toolbar" class="sc-toolbar">
+                <div class="sc-actions">
+                    <span style="font-weight:600; color:var(--text-muted);">Active Subcarriers: <span id="sc-selected-count" style="color:var(--accent-blue)">4</span></span>
+                    <div style="display:flex; gap:6px;">
+                        <button class="btn btn-ghost btn-xs" onclick="setPresetSC([1, 5, 9, 13])">Default (1,5,9,13)</button>
+                        <button class="btn btn-ghost btn-xs" onclick="setPresetSC([0, 8, 16, 24, 32, 40, 48, 56])">Octaves</button>
+                        <button class="btn btn-ghost btn-xs" onclick="setPresetSC(Array.from({length: 16}, (_, i) => i * 4))">Every 4th</button>
+                        <button class="btn btn-ghost btn-xs" onclick="clearSC()">Clear</button>
+                    </div>
+                </div>
+                <div id="sc-chips-container" class="sc-chips">
+                    <!-- SC chips populated via JS -->
+                </div>
+            </div>
+
+            <!-- Canvas Container -->
+            <div class="chart-canvas-wrapper">
+                <canvas id="mainChart"></canvas>
+            </div>
+        </section>
+
+        <!-- Bottom Grid: Terminal Log & Session Recordings -->
+        <section class="bottom-grid">
+            <!-- Terminal Log -->
+            <div class="panel-box">
+                <div class="panel-header">
+                    <div class="panel-title">
+                        <span>Console Stream</span>
+                        <span id="log-count" style="font-size:11px; font-weight:normal; color:var(--text-dim)">(0 lines)</span>
+                    </div>
+                    <div style="display:flex; gap:6px;">
+                        <label style="font-size:11px; color:var(--text-muted); display:flex; align-items:center; gap:4px; cursor:pointer;">
+                            <input type="checkbox" id="autoscroll-chk" checked> Auto-scroll
+                        </label>
+                        <button class="btn btn-ghost btn-xs" onclick="clearLogs()">Clear</button>
+                    </div>
+                </div>
+                <div id="terminal" class="terminal-content">
+                    <div class="term-row"><span class="term-txt" style="color:var(--text-dim)">Console ready.</span></div>
+                </div>
+            </div>
+
+            <!-- Session Recordings Panel -->
+            <div class="panel-box">
+                <div class="panel-header">
+                    <div class="panel-title">
+                        <span>Saved CSV Sessions</span>
+                    </div>
+                    <button class="btn btn-ghost btn-xs" onclick="loadRecordings()">↻ Refresh</button>
+                </div>
+                <div class="recordings-content">
+                    <table class="recordings-table">
+                        <thead>
+                            <tr>
+                                <th>File Name</th>
+                                <th>Size</th>
+                                <th>Time</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="recordings-tbody">
+                            <tr><td colspan="4" style="text-align:center; color:var(--text-dim);">Loading sessions...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div id="toast-container"></div>
+
+    <script>
+        // ── Global State ──
+        let isConnected = false;
+        let isRecording = false;
+        let isPaused = false;
+        let currentChartTab = 'subcarriers'; // 'subcarriers' | 'spectrum' | 'rssi'
+        let lastFrameId = -1;
+        let lastLogId = -1;
+        let pollTimer = null;
+        let timeWindowSec = 30;
+
+        // Subcarrier selection
+        const MAX_SUBCARRIERS = 64;
+        let selectedSubcarriers = new Set([1, 5, 9, 13]);
+
+        // In-memory data store for live charts (capped by time window)
+        // frames: [{ id, t, tx, rssi, amp: [] }]
+        let frameHistory = [];
+        let latestFrameByTx = {};
+
+        // TX Palette
+        const TX_COLORS = {
+            1: '#3b82f6', // Blue
+            2: '#ec4899', // Pink
+            3: '#10b981', // Emerald
+            4: '#f59e0b', // Amber
+            5: '#8b5cf6', // Violet
+            6: '#06b6d4', // Cyan
+        };
+        function getTxColor(txId) {
+            return TX_COLORS[txId] || '#9ca3af';
+        }
+
+        const SC_PALETTE = [
+            '#3b82f6', '#ec4899', '#10b981', '#f59e0b', '#8b5cf6',
+            '#06b6d4', '#f43f5e', '#84cc16', '#a855f7', '#14b8a6',
+            '#eab308', '#6366f1'
+        ];
+
+        // ── Toast Utility ──
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.textContent = message;
+            container.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                setTimeout(() => toast.remove(), 300);
+            }, 3500);
+        }
+
+        // ── Initialize Subcarrier Chips ──
+        function initSubcarrierChips() {
+            const container = document.getElementById('sc-chips-container');
+            container.innerHTML = '';
+            for (let i = 0; i < MAX_SUBCARRIERS; i++) {
+                const chip = document.createElement('div');
+                chip.className = `sc-chip ${selectedSubcarriers.has(i) ? 'selected' : ''}`;
+                chip.textContent = `SC${i}`;
+                chip.onclick = () => toggleSubcarrier(i);
+                container.appendChild(chip);
+            }
+            updateScCount();
+        }
+
+        function toggleSubcarrier(index) {
+            if (selectedSubcarriers.has(index)) {
+                selectedSubcarriers.delete(index);
+            } else {
+                selectedSubcarriers.add(index);
+            }
+            renderSubcarrierChips();
+            renderCharts(true);
+        }
+
+        function renderSubcarrierChips() {
+            const chips = document.querySelectorAll('.sc-chip');
+            chips.forEach((chip, i) => {
+                if (selectedSubcarriers.has(i)) {
+                    chip.classList.add('selected');
+                } else {
+                    chip.classList.remove('selected');
+                }
+            });
+            updateScCount();
+        }
+
+        function updateScCount() {
+            document.getElementById('sc-selected-count').textContent = selectedSubcarriers.size;
+        }
+
+        function setPresetSC(arr) {
+            selectedSubcarriers = new Set(arr);
+            renderSubcarrierChips();
+            renderCharts(true);
+        }
+
+        function clearSC() {
+            selectedSubcarriers.clear();
+            renderSubcarrierChips();
+            renderCharts(true);
+        }
+
+        // ── Setup Chart.js ──
+        let chartInstance = null;
+
+        function initChart() {
+            const ctx = document.getElementById('mainChart').getContext('2d');
+            chartInstance = new Chart(ctx, {
+                type: 'line',
+                data: { datasets: [] },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    interaction: {
+                        mode: 'nearest',
+                        axis: 'x',
+                        intersect: false
+                    },
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: {
+                                color: '#9ca3af',
+                                boxWidth: 12,
+                                font: { family: 'JetBrains Mono', size: 11 }
+                            }
+                        },
+                        tooltip: {
+                            backgroundColor: '#1f2937',
+                            borderColor: '#374151',
+                            borderWidth: 1,
+                            titleFont: { family: 'Inter', size: 12 },
+                            bodyFont: { family: 'JetBrains Mono', size: 11 }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: { display: true, text: 'Time (s)', color: '#6b7280', font: { size: 11 } },
+                            grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                            ticks: { color: '#9ca3af', font: { family: 'JetBrains Mono', size: 10 } }
+                        },
+                        y: {
+                            title: { display: true, text: 'Amplitude', color: '#6b7280', font: { size: 11 } },
+                            grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                            ticks: { color: '#9ca3af', font: { family: 'JetBrains Mono', size: 10 } }
+                        }
+                    }
+                }
+            });
+        }
+
+        function switchChartTab(tab) {
+            currentChartTab = tab;
+            document.querySelectorAll('.chart-tab-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+
+            const scToolbar = document.getElementById('sc-toolbar');
+            if (tab === 'subcarriers') {
+                scToolbar.style.display = 'flex';
+            } else {
+                scToolbar.style.display = 'none';
+            }
+
+            // Configure chart type & axis labels
+            if (tab === 'spectrum') {
+                chartInstance.config.type = 'bar';
+                chartInstance.options.scales.x.title.text = 'Subcarrier Index (0 - 63)';
+                chartInstance.options.scales.y.title.text = 'CSI Amplitude';
+            } else if (tab === 'rssi') {
+                chartInstance.config.type = 'line';
+                chartInstance.options.scales.x.title.text = 'Time (s)';
+                chartInstance.options.scales.y.title.text = 'RSSI (dBm)';
+            } else { // subcarriers
+                chartInstance.config.type = 'line';
+                chartInstance.options.scales.x.title.text = 'Time (s)';
+                chartInstance.options.scales.y.title.text = 'Subcarrier Amplitude';
+            }
+
+            renderCharts(true);
+        }
+
+        function onTimeWindowChange() {
+            timeWindowSec = parseInt(document.getElementById('time-window').value, 10);
+            renderCharts(true);
+        }
+
+        function togglePause() {
+            isPaused = !isPaused;
+            const btn = document.getElementById('btn-pause');
+            if (isPaused) {
+                btn.textContent = '▶ Resume';
+                btn.classList.add('btn-primary');
+                btn.classList.remove('btn-ghost');
+            } else {
+                btn.textContent = '⏸ Pause';
+                btn.classList.remove('btn-primary');
+                btn.classList.add('btn-ghost');
+            }
+        }
+
+        function clearData() {
+            frameHistory = [];
+            latestFrameByTx = {};
+            renderCharts(true);
+        }
+
+        function toggleFullscreen() {
+            const section = document.querySelector('.chart-section');
+            if (!section) return;
+            const isFs = section.classList.toggle('fullscreen');
+            const btn = document.getElementById('btn-fullscreen');
+            const icon = document.getElementById('fs-icon');
+            const txt = document.getElementById('fs-text');
+
+            if (isFs) {
+                if (btn) {
+                    btn.classList.add('btn-primary');
+                    btn.classList.remove('btn-ghost');
+                }
+                if (icon) icon.textContent = '✕';
+                if (txt) txt.textContent = 'Küçült (Esc)';
+                if (document.documentElement.requestFullscreen && !document.fullscreenElement) {
+                    document.documentElement.requestFullscreen().catch(() => {});
+                }
+            } else {
+                if (btn) {
+                    btn.classList.remove('btn-primary');
+                    btn.classList.add('btn-ghost');
+                }
+                if (icon) icon.textContent = '⛶';
+                if (txt) txt.textContent = 'Tam Ekran';
+                if (document.fullscreenElement && document.exitFullscreen) {
+                    document.exitFullscreen().catch(() => {});
+                }
+            }
+
+            setTimeout(() => {
+                if (chartInstance) {
+                    chartInstance.resize();
+                    renderCharts(true);
+                }
+            }, 60);
+        }
+
+        // Keyboard shortcuts: F for Fullscreen, Esc to exit
+        document.addEventListener('keydown', (e) => {
+            const activeTag = document.activeElement ? document.activeElement.tagName.toLowerCase() : '';
+            if (activeTag === 'input' || activeTag === 'textarea' || activeTag === 'select') return;
+
+            if (e.key === 'Escape') {
+                const section = document.querySelector('.chart-section');
+                if (section && section.classList.contains('fullscreen')) {
+                    toggleFullscreen();
+                }
+            } else if (e.key === 'f' || e.key === 'F') {
+                toggleFullscreen();
+            }
+        });
+
+        // Sync state if user exits via browser ESC or F11
+        document.addEventListener('fullscreenchange', () => {
+            const section = document.querySelector('.chart-section');
+            if (!document.fullscreenElement && section && section.classList.contains('fullscreen')) {
+                section.classList.remove('fullscreen');
+                const btn = document.getElementById('btn-fullscreen');
+                const icon = document.getElementById('fs-icon');
+                const txt = document.getElementById('fs-text');
+                if (btn) {
+                    btn.classList.remove('btn-primary');
+                    btn.classList.add('btn-ghost');
+                }
+                if (icon) icon.textContent = '⛶';
+                if (txt) txt.textContent = 'Tam Ekran';
+                setTimeout(() => {
+                    if (chartInstance) {
+                        chartInstance.resize();
+                        renderCharts(true);
+                    }
+                }, 60);
+            }
+        });
+
+        // ── Render Chart Datasets ──
+        function renderCharts(forceUpdate = false) {
+            if (!chartInstance) return;
+
+            const txFilter = document.getElementById('tx-filter').value;
+            const activeFrames = frameHistory;
+
+            if (currentChartTab === 'spectrum') {
+                // Instantaneous Subcarrier Spectrum (Bar Chart)
+                const datasets = [];
+                const txIds = Object.keys(latestFrameByTx);
+
+                txIds.forEach(txId => {
+                    if (txFilter !== 'all' && txFilter !== txId) return;
+                    const frame = latestFrameByTx[txId];
+                    if (!frame || !frame.amp) return;
+
+                    const color = getTxColor(txId);
+                    datasets.push({
+                        label: `TX${txId} Spectrum`,
+                        data: frame.amp.slice(0, 64).map((val, idx) => ({ x: idx, y: val })),
+                        backgroundColor: color + '99',
+                        borderColor: color,
+                        borderWidth: 1,
+                        borderRadius: 2
+                    });
+                });
+
+                chartInstance.data.datasets = datasets;
+                chartInstance.update(forceUpdate ? 'default' : 'none');
+                return;
+            }
+
+            if (currentChartTab === 'rssi') {
+                // RSSI Time Series
+                const txDataMap = {};
+                activeFrames.forEach(f => {
+                    const txId = f.tx;
+                    if (txFilter !== 'all' && txFilter !== String(txId)) return;
+                    if (!txDataMap[txId]) txDataMap[txId] = [];
+                    txDataMap[txId].push({ x: f.t, y: f.rssi });
+                });
+
+                const datasets = Object.keys(txDataMap).map(txId => {
+                    const color = getTxColor(txId);
+                    return {
+                        label: `TX${txId} RSSI`,
+                        data: txDataMap[txId],
+                        borderColor: color,
+                        backgroundColor: color + '22',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        tension: 0.1
+                    };
+                });
+
+                chartInstance.data.datasets = datasets;
+                chartInstance.update(forceUpdate ? 'default' : 'none');
+                return;
+            }
+
+            // Subcarriers Time Series
+            const scDatasets = [];
+            const subArray = Array.from(selectedSubcarriers).sort((a,b) => a - b);
+
+            subArray.forEach((scIdx, i) => {
+                const color = SC_PALETTE[i % SC_PALETTE.length];
+                const points = [];
+
+                activeFrames.forEach(f => {
+                    if (txFilter !== 'all' && txFilter !== String(f.tx)) return;
+                    if (f.amp && f.amp[scIdx] !== undefined) {
+                        points.push({ x: f.t, y: f.amp[scIdx] });
+                    }
+                });
+
+                scDatasets.push({
+                    label: `SC ${scIdx}`,
+                    data: points,
+                    borderColor: color,
+                    backgroundColor: color + '11',
+                    borderWidth: 1.8,
+                    pointRadius: 0,
+                    tension: 0.1
+                });
+            });
+
+            chartInstance.data.datasets = scDatasets;
+            chartInstance.update(forceUpdate ? 'default' : 'none');
+        }
+
+        // ── Serial Connection Management ──
+        async function loadPorts() {
+            try {
+                const res = await fetch('/api/ports');
+                const data = await res.json();
+                const select = document.getElementById('port-select');
+                select.innerHTML = '';
+
+                if (!data.ports || data.ports.length === 0) {
+                    select.innerHTML = '<option value="">No Ports Found</option>';
+                    return;
+                }
+
+                data.ports.forEach(p => {
+                    const opt = document.createElement('option');
+                    opt.value = p.device;
+                    let label = `${p.device}`;
+                    if (p.config_role === 'RECEIVER') {
+                        label += ` [★ Receiver]`;
+                    } else if (p.config_role) {
+                        label += ` [${p.config_role}]`;
+                    }
+                    if (p.description) {
+                        label += ` - ${p.description.substring(0, 24)}`;
+                    }
+                    opt.textContent = label;
+                    select.appendChild(opt);
+                });
+
+                if (data.suggested) {
+                    select.value = data.suggested;
+                }
+            } catch (err) {
+                console.error("Failed to load ports:", err);
+            }
+        }
+
+        async function toggleConnect() {
+            const btn = document.getElementById('btn-connect');
+            if (isConnected) {
+                // Disconnect
+                btn.disabled = true;
+                try {
+                    await fetch('/api/disconnect', { method: 'POST' });
+                    showToast('Disconnected from ESP32', 'info');
+                } catch (err) {
+                    showToast('Failed to disconnect: ' + err.message, 'error');
+                }
+                btn.disabled = false;
+            } else {
+                // Connect
+                const port = document.getElementById('port-select').value;
+                const baud = parseInt(document.getElementById('baud-select').value, 10);
+                if (!port) {
+                    showToast('Please select a serial port', 'error');
+                    return;
+                }
+                btn.disabled = true;
+                btn.textContent = 'Connecting...';
+                try {
+                    const res = await fetch('/api/connect', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ port, baud, reset: false })
+                    });
+                    const data = await res.json();
+                    if (data.ok) {
+                        showToast(`Connected to ${port} @ ${baud}`, 'success');
+                    } else {
+                        showToast(data.error || 'Failed to connect', 'error');
+                    }
+                } catch (err) {
+                    showToast('Connection error: ' + err.message, 'error');
+                }
+                btn.disabled = false;
+            }
+        }
+
+        async function toggleRecord() {
+            const btn = document.getElementById('btn-record');
+            btn.disabled = true;
+            try {
+                if (isRecording) {
+                    const res = await fetch('/api/record/stop', { method: 'POST' });
+                    const data = await res.json();
+                    showToast(`Recording saved (${data.saved?.rows || 0} frames)`, 'success');
+                    loadRecordings();
+                } else {
+                    const res = await fetch('/api/record/start', { method: 'POST' });
+                    const data = await res.json();
+                    if (data.ok) {
+                        showToast('Recording started', 'success');
+                    } else {
+                        showToast(data.error || 'Could not start recording', 'error');
+                    }
+                }
+            } catch (err) {
+                showToast('Recording action failed: ' + err.message, 'error');
+            }
+            btn.disabled = false;
+        }
+
+        // ── Data Polling Loop ──
+        async function poll() {
+            try {
+                const params = new URLSearchParams({
+                    since: lastFrameId,
+                    log_since: lastLogId
+                });
+                const res = await fetch(`/api/poll?${params.toString()}`);
+                if (!res.ok) throw new Error('Poll response error');
+                const data = await res.json();
+
+                updateUI(data);
+            } catch (err) {
+                // Network error or server restarted
+            } finally {
+                pollTimer = setTimeout(poll, 80); // 12.5 Hz ultra-low latency poll (~80ms)
+            }
+        }
+
+        function updateUI(data) {
+            const status = data.status || {};
+            const txList = data.tx || [];
+            const diag = data.diag || {};
+
+            // 1. Connection & Header State
+            isConnected = status.connected;
+            const dot = document.getElementById('status-dot');
+            const stText = document.getElementById('status-text');
+            const btnConn = document.getElementById('btn-connect');
+            const btnRec = document.getElementById('btn-record');
+            const recInfo = document.getElementById('rec-status-info');
+
+            if (isConnected) {
+                btnConn.textContent = 'Disconnect';
+                btnConn.className = 'btn btn-danger';
+                btnRec.disabled = false;
+
+                if (status.csi_live) {
+                    dot.className = 'dot live';
+                    stText.textContent = `Streaming (${status.port})`;
+                } else if (status.serial_live) {
+                    dot.className = 'dot waiting';
+                    stText.textContent = `Serial Live (${status.port})`;
+                } else {
+                    dot.className = 'dot waiting';
+                    stText.textContent = `Connected (${status.port})`;
+                }
+            } else {
+                btnConn.textContent = 'Connect';
+                btnConn.className = 'btn btn-primary';
+                btnRec.disabled = true;
+                dot.className = 'dot stopped';
+                stText.textContent = 'Disconnected';
+            }
+
+            // Recording state
+            isRecording = status.recording?.active;
+            if (isRecording) {
+                btnRec.className = 'btn btn-record recording';
+                btnRec.textContent = '⏹ Stop Rec';
+                recInfo.style.display = 'inline';
+                recInfo.textContent = `● REC ${status.recording.rows} pkts (${status.recording.elapsed}s)`;
+            } else {
+                btnRec.className = 'btn btn-record';
+                btnRec.textContent = '⏺ Record CSV';
+                recInfo.style.display = 'none';
+            }
+
+            // 2. Metrics Bar
+            document.getElementById('m-csi-hz').innerHTML = `${status.csi_hz || 0} <span style="font-size:14px; font-weight:400; color:var(--text-muted)">Hz</span>`;
+            document.getElementById('m-csi-total').textContent = `${status.csi_frames || 0} frames | ${status.espnow_packets || 0} esp-now`;
+
+            document.getElementById('m-active-tx').textContent = txList.length;
+            document.getElementById('m-role-guess').textContent = `Role: ${status.role_guess || (isConnected ? 'Observing...' : 'Disconnected')}`;
+
+            const speedKb = (status.bytes_per_s / 1024).toFixed(1);
+            document.getElementById('m-uart-speed').innerHTML = `${speedKb} <span style="font-size:14px; font-weight:400; color:var(--text-muted)">kB/s</span>`;
+            document.getElementById('m-uart-load').textContent = `Bus load: ${(status.uart_load * 100).toFixed(1)}%`;
+
+            document.getElementById('m-diag-matches').innerHTML = `${diag.matches ?? 0} <span style="font-size:14px; font-weight:400; color:var(--text-muted)">matches</span>`;
+            document.getElementById('m-diag-drops').textContent = `Drops: ${diag.queue_drop ?? 0} | ZeroLen: ${diag.zero_len ?? 0}`;
+
+            const lastAge = status.last_csi_age;
+            const latElem = document.getElementById('m-latency');
+            const latSub = document.getElementById('m-latency-sub');
+            if (lastAge != null && isConnected) {
+                const ms = Math.round(lastAge * 1000);
+                latElem.innerHTML = `${lastAge.toFixed(2)} <span style="font-size:14px; font-weight:400; color:var(--text-muted)">s</span>`;
+                if (lastAge < 0.3) {
+                    latSub.textContent = `⚡ Real-time (${ms}ms)`;
+                    latSub.style.color = 'var(--accent-green)';
+                } else if (lastAge < 1.0) {
+                    latSub.textContent = `⚡ Good (<1s)`;
+                    latSub.style.color = 'var(--accent-amber)';
+                } else {
+                    latSub.textContent = `Delay (${lastAge.toFixed(1)}s)`;
+                    latSub.style.color = 'var(--accent-red)';
+                }
+            } else {
+                latElem.innerHTML = `— <span style="font-size:14px; font-weight:400; color:var(--text-muted)">s</span>`;
+                latSub.textContent = isConnected ? 'Waiting...' : 'Disconnected';
+                latSub.style.color = 'var(--text-dim)';
+            }
+
+            // 3. Update TX Cards
+            updateTxCards(txList);
+
+            // 4. Update TX Filter Dropdown
+            syncTxFilterDropdown(txList);
+
+            // 5. Append New Frames
+            if (!isPaused && data.frames && data.frames.length > 0) {
+                lastFrameId = data.last_frame_id;
+                data.frames.forEach(f => {
+                    frameHistory.push(f);
+                    latestFrameByTx[f.tx] = f;
+                });
+
+                // Trim frames outside current time window
+                const latestTime = frameHistory[frameHistory.length - 1].t;
+                const cutoff = latestTime - timeWindowSec;
+                let removeIdx = 0;
+                while (removeIdx < frameHistory.length && frameHistory[removeIdx].t < cutoff) {
+                    removeIdx++;
+                }
+                if (removeIdx > 0) {
+                    frameHistory.splice(0, removeIdx);
+                }
+
+                renderCharts(false);
+            }
+
+            // 6. Append New Logs
+            if (data.logs && data.logs.length > 0) {
+                lastLogId = data.last_log_id;
+                appendLogs(data.logs);
+            }
+        }
+
+        // ── TX Cards Rendering ──
+        function updateTxCards(txList) {
+            const container = document.getElementById('tx-cards');
+            if (!txList || txList.length === 0) {
+                if (isConnected) {
+                    container.innerHTML = `
+                        <div style="grid-column: 1 / -1; text-align: center; padding: 20px; color: var(--text-muted); background: var(--bg-surface); border-radius: 8px; border: 1px dashed var(--border);">
+                            Waiting for incoming CSI frames from transmitters...
+                        </div>`;
+                }
+                return;
+            }
+
+            container.innerHTML = txList.map(tx => {
+                const color = getTxColor(tx.id);
+                return `
+                <div class="tx-card" style="border-left: 4px solid ${color};">
+                    <div class="tx-card-header">
+                        <div class="tx-title">
+                            <span class="tx-badge" style="background:${color}">TX ${tx.id}</span>
+                            <span>Transmitter Node</span>
+                        </div>
+                        <span style="font-size:12px; font-family:'JetBrains Mono',monospace; color:${tx.rssi ? 'var(--accent-green)' : 'var(--text-dim)'}">
+                            ${tx.last_seen_age != null ? tx.last_seen_age + 's ago' : '—'}
+                        </span>
+                    </div>
+
+                    <div class="tx-stats-grid">
+                        <div class="tx-stat-item">
+                            <span class="lbl">RSSI</span>
+                            <span class="val" style="color:${color}">${tx.rssi != null ? tx.rssi + ' dBm' : '—'}</span>
+                        </div>
+                        <div class="tx-stat-item">
+                            <span class="lbl">Rate</span>
+                            <span class="val">${tx.csi_hz ?? 0} Hz</span>
+                        </div>
+                        <div class="tx-stat-item">
+                            <span class="lbl">Loss</span>
+                            <span class="val" style="color:${(tx.loss_pct > 5) ? 'var(--accent-red)' : 'var(--text-main)'}">
+                                ${tx.loss_pct != null ? tx.loss_pct + '%' : '0%'}
+                            </span>
+                        </div>
+                    </div>
+
+                    <div class="tx-meta">
+                        <span>Ch: ${tx.channel ?? '—'} / BW: ${tx.bandwidth ? tx.bandwidth + 'MHz' : '—'}</span>
+                        <span>Frames: ${tx.frames ?? 0}</span>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        function syncTxFilterDropdown(txList) {
+            const sel = document.getElementById('tx-filter');
+            const current = sel.value;
+            const existingVals = new Set(Array.from(sel.options).map(o => o.value));
+
+            txList.forEach(tx => {
+                const val = String(tx.id);
+                if (!existingVals.has(val)) {
+                    const opt = document.createElement('option');
+                    opt.value = val;
+                    opt.textContent = `TX ${tx.id} only`;
+                    sel.appendChild(opt);
+                }
+            });
+        }
+
+        // ── Console Stream ──
+        function appendLogs(logs) {
+            const term = document.getElementById('terminal');
+            const autoscroll = document.getElementById('autoscroll-chk').checked;
+
+            logs.forEach(l => {
+                const row = document.createElement('div');
+                row.className = 'term-row';
+                row.innerHTML = `
+                    <span class="term-ts">${l.ts}</span>
+                    <span class="term-tag ${l.kind}">${l.kind.toUpperCase()}</span>
+                    <span class="term-txt">${escapeHtml(l.text)}</span>
+                `;
+                term.appendChild(row);
+            });
+
+            // Keep DOM elements bounded to 400
+            while (term.children.length > 400) {
+                term.removeChild(term.firstChild);
+            }
+
+            document.getElementById('log-count').textContent = `(${term.children.length} lines)`;
+
+            if (autoscroll) {
+                term.scrollTop = term.scrollHeight;
+            }
+        }
+
+        function clearLogs() {
+            const term = document.getElementById('terminal');
+            term.innerHTML = '';
+            document.getElementById('log-count').textContent = '(0 lines)';
+        }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        // ── Recordings Table ──
+        async function loadRecordings() {
+            const tbody = document.getElementById('recordings-tbody');
+            try {
+                const res = await fetch('/api/recordings');
+                const list = await res.json();
+                if (!list || list.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--text-dim);">No saved recordings yet.</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = list.map(item => {
+                    const sizeKb = (item.size / 1024).toFixed(1);
+                    return `
+                    <tr>
+                        <td title="${item.path}"><strong>${escapeHtml(item.name)}</strong></td>
+                        <td>${sizeKb} KB</td>
+                        <td>${item.mtime}</td>
+                        <td>
+                            <a href="/recordings/${encodeURIComponent(item.path)}" download class="btn btn-ghost btn-xs">Download</a>
+                        </td>
+                    </tr>`;
+                }).join('');
+            } catch (err) {
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--accent-red);">Failed to load recordings</td></tr>';
+            }
+        }
+
+        // ── Initialization ──
+        window.addEventListener('DOMContentLoaded', () => {
+            initSubcarrierChips();
+            initChart();
+            loadPorts();
+            loadRecordings();
+            poll();
+        });
+    </script>
+</body>
+</html>
+

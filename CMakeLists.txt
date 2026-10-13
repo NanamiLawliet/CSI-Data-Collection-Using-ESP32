@@ -4,5 +4,9 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.5)
 
+set(CMAKE_C_ARCHIVE_FINISH "<CMAKE_AR> s <TARGET>")
+set(CMAKE_CXX_ARCHIVE_FINISH "<CMAKE_AR> s <TARGET>")
+set(CMAKE_ASM_ARCHIVE_FINISH "<CMAKE_AR> s <TARGET>")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(project-name)

@@ -1,1104 +1,819 @@
-from flask import Flask, render_template, jsonify, request
-import serial
-import json
-import re
-import datetime
+"""
+web_app.py  —  Live web dashboard for the ESP32 ESP-NOW CSI receiver.
+
+Connects to the RECEIVER board's serial port, parses the lines emitted by
+main/main.c (CSI_START{...}CSI_END, ESP_NOW_RX logs, CSI diag logs), shows them
+live in the browser and optionally records the CSI frames to
+
+    sessions/session-<id>/csi_data_<timestamp>.csv
+
+using the same column layout as csi_log_viewer.py.
+
+Run:   py web_app.py                          then open http://localhost:5000
+       py web_app.py --serial COM11            auto-connect on start
+       py web_app.py --serial COM11 --record   auto-connect and start recording
+Deps:  py -m pip install flask pyserial
+
+NOTE (Windows + ESP-IDF): inside an ESP-IDF terminal `python` points to the
+ESP-IDF interpreter, which has no Flask. Use `py web_app.py` instead.
+"""
+
+import sys
+
+try:
+    from flask import Flask, jsonify, request, send_from_directory
+    import serial
+    import serial.tools.list_ports
+except ImportError as exc:  # pragma: no cover - environment problem, not code
+    print(
+        f"\n[web_app] Missing Python package: {exc.name}\n"
+        f"  Interpreter in use: {sys.executable}\n"
+        "  If this is the ESP-IDF Python (C:\\Espressif\\...), start the app with your\n"
+        "  normal Python instead:\n"
+        "      py web_app.py\n"
+        "  and install the dependencies with:\n"
+        "      py -m pip install flask pyserial\n"
+    )
+    sys.exit(1)
+
+import argparse
+import atexit
 import csv
+import datetime
+import glob
+import itertools
+import json
+import logging
+import math
+import os
+import re
 import threading
 import time
-import os
-import atexit
-import signal
-from collections import deque
 import uuid
+from collections import deque
+
+# ── configuration ────────────────────────────────────────────────────────────
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+
+DEFAULT_BAUD = 115200        # must match uart_config.baud_rate in main/main.c
+GROUP_WINDOW_MS = 50         # must match firmware SEND_INTERVAL_MS; frames from
+                             # different TXs in the same window share a group_id
+FRAME_BUFFER = 4000          # CSI frames kept in memory for the live plots
+LOG_BUFFER = 600             # serial console lines kept in memory
+INITIAL_FRAMES = 1500        # frames sent to a freshly opened browser tab
+RATE_WINDOW_S = 2.0          # window used for Hz / bytes-per-second figures
+
+CSV_FIELDS = [
+    'timestamp', 'group_id', 'tx_id',
+    'packet_type', 'rssi', 'rate', 'channel', 'bandwidth',
+    'data_length', 'esp_timestamp', 'csi_data', 'seq',
+]
 
 CSI_REGEX = re.compile(r'CSI_START(\{.+\})CSI_END')
-ESPNOW_REGEX = re.compile(r'RX,SEQ=(\d+),RSSI=(-?\d+),TS=(\d+)')
-ESPNOW_LOG_REGEX = re.compile(r'seq=(\d+)(?:\s+tx_id=(\d+))?\s+rssi=(-?\d+)', re.IGNORECASE)
-
-# Base diag fields; txN=M pairs are parsed separately via TX_DIAG_REGEX for N-TX extensibility
+ESPNOW_RX_REGEX = re.compile(r'seq=(\d+)(?:\s+tx_id=(\d+))?\s+rssi=(-?\d+)', re.IGNORECASE)
+ESPNOW_LEGACY_REGEX = re.compile(r'RX,SEQ=(\d+),RSSI=(-?\d+),TS=(\d+)')
+# Base diag fields; txN=M pairs are parsed separately for N-TX extensibility
 CSI_DIAG_REGEX = re.compile(
     r'callbacks=(\d+)\s+matches=(\d+)\s+zero_len=(\d+)\s+queue_drop=(\d+)',
     re.IGNORECASE,
 )
-TX_DIAG_REGEX = re.compile(r'tx(\d+)=(\d+)', re.IGNORECASE)
+TX_DIAG_REGEX = re.compile(r'\btx(\d+)=(\d+)', re.IGNORECASE)
+ANSI_REGEX = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
-# Must match firmware SEND_INTERVAL_MS.  Frames arriving within the same window
-# share a group_id so a pandas groupby('group_id') gives you synchronized sets.
-GROUP_WINDOW_MS = 50
-
-app = Flask(__name__)
+INSTANCE_ID = uuid.uuid4().hex[:8]   # lets the browser detect a server restart
 
 
-class ESPNOWDataLogger:
-    def __init__(self, port, baud_rate=115200):
-        self.port = port
-        self.baud_rate = baud_rate
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def guess_role(text):
+    """Guess the firmware role of a board from a chunk of its serial output."""
+    if 'ESP_NOW_TX' in text or 'ROLE:TRANSMITTER' in text:
+        return 'TRANSMITTER'
+    if ('CSI_START' in text or 'ESP_NOW_RX' in text or 'CSI diag' in text
+            or 'ROLE:RECEIVER' in text):
+        return 'RECEIVER'
+    if 'ROLE:IDLE' in text:
+        return 'IDLE'
+    return None
+
+
+def csi_amplitudes(raw):
+    """ESP32 CSI buffers are int8 (imag, real) pairs -> per-subcarrier amplitude."""
+    n = len(raw) // 2
+    out = []
+    for k in range(n):
+        try:
+            out.append(round(math.hypot(raw[2 * k], raw[2 * k + 1]), 1))
+        except TypeError:
+            out.append(None)
+    return out
+
+
+def open_serial(port, baud, timeout=0.02):
+    s = serial.Serial()
+    s.port = port
+    s.baudrate = baud
+    s.timeout = timeout
+    # Set BEFORE open(): otherwise Windows asserts DTR/RTS on open, which can
+    # reset the board or hold it in the bootloader.
+    s.dtr = False
+    s.rts = False
+    s.open()
+    try:
+        s.set_buffer_size(rx_size=65536)
+    except Exception:
+        pass
+    return s
+
+
+def friendly_serial_error(port, exc):
+    msg = str(exc)
+    low = msg.lower()
+    if 'permissionerror' in low or 'denied' in low or 'erişim' in low or 'errno 13' in low:
+        return (f"{port} is busy — another program has it open (CSI Log Viewer, "
+                f"Central Control, idf.py monitor, a serial monitor...). Close it and try again.")
+    if 'filenotfounderror' in low or 'cannot find' in low or 'no such file' in low:
+        return f"{port} was not found. Is the board plugged in?"
+    return f"Could not open {port}: {msg}"
+
+
+def load_config_roles():
+    """{port: set(roles)} from config.json written by central_control.py."""
+    roles = {}
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            for dev in json.load(f).get('devices', {}).values():
+                port, role = dev.get('port'), dev.get('role')
+                if port and role:
+                    roles.setdefault(port, set()).add(role)
+    except Exception:
+        pass
+    return roles
+
+
+def _port_sort_key(device):
+    nums = re.findall(r'\d+', device)
+    return (re.sub(r'\d+', '', device), int(nums[-1]) if nums else 0)
+
+
+# ── serial monitor / recorder ────────────────────────────────────────────────
+
+class CSIMonitor:
+    def __init__(self):
+        self.lock = threading.RLock()
         self.serial_conn = None
-        self.csv_writer = None
+        self.reader_thread = None
+        self.stop_event = threading.Event()
+        self.port = None
+        self.baud = DEFAULT_BAUD
+        self.conn_id = 0
+        self.error = None
+        self._frame_ids = itertools.count(1)
+        self._log_ids = itertools.count(1)
+        self.last_frame_id = 0
+        self.last_log_id = 0
+        self.frames = deque(maxlen=FRAME_BUFFER)
+        self.logs = deque(maxlen=LOG_BUFFER)
+        # recording state
         self.csv_file = None
-        self.logging_thread = None
-        self.is_running = False
-        self.packet_count = 0
-        self.session_start_time = None
-        self.session_id = str(uuid.uuid4())[:8]
-        self.session_dir = f"sessions/session-{self.session_id}"
-        os.makedirs(self.session_dir, exist_ok=True)
-
-        self.recent_data = deque(maxlen=100)
-        self.latest_by_tx = {}          # {tx_id: display_data_dict}
-        self.plot_data_by_tx = {}       # {tx_id: deque(maxlen=200)}
-        self.available_subcarriers = set()
-        self.raw_lines = deque(maxlen=50)
-        self.raw_line_count = 0
-        self.csi_packet_count = 0
-        self.espnow_packet_count = 0
-        self.last_packet_time = None
-        self.last_csi_time = None
-        self.last_packet_type = None
-        self.last_raw_line = None
-        self.last_raw_line_time = None
-        self.csi_diag = {}
-        self.tx_stats = {}              # {tx_id: {packet_count, last_rssi, last_time}}
-        self.pending_seq_by_tx = {}     # {tx_id: seq}
-        self.pending_seq_time_by_tx = {}
-
-    # ── serial ────────────────────────────────────────────────────────────────
-
-    def connect(self):
-        try:
-            self.serial_conn = serial.Serial(self.port, self.baud_rate, timeout=1, dsrdtr=False, rtscts=False)
-            # Standard ESP32 reset sequence to boot into the application normally
-            self.serial_conn.dtr = False
-            self.serial_conn.rts = True
-            time.sleep(0.1)
-            self.serial_conn.rts = False
-            time.sleep(0.05)
-            self.serial_conn.dtr = False
-            # Wait for boot phase to complete
-            time.sleep(1.5)
-            print(f"Connected to ESP32 on {self.port}")
-            return True
-        except serial.SerialException as e:
-            print(f"Failed to connect: {e}")
-            return False
-
-    # ── CSV ───────────────────────────────────────────────────────────────────
-
-    def setup_csv_file(self):
-        try:
-            self._close_csv_file()
-            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"csi_data_{timestamp}.csv"
-            filepath = os.path.join(self.session_dir, filename)
-            os.makedirs(self.session_dir, exist_ok=True)
-            self.csv_file = open(filepath, 'w', newline='', encoding='utf-8')
-
-            # group_id ties together frames from different TXs in the same time window.
-            # tx_id identifies which transmitter sent the frame.
-            # Use pandas: df.groupby('group_id') to get synchronized TX pairs/sets.
-            fieldnames = [
-                'timestamp', 'group_id', 'tx_id',
-                'packet_type', 'rssi', 'rate', 'channel', 'bandwidth',
-                'data_length', 'esp_timestamp', 'csi_data', 'seq',
-            ]
-            self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=fieldnames)
-            self.csv_writer.writeheader()
-            self.csv_file.flush()
-            return filepath
-        except Exception as e:
-            print(f"[ERROR] Failed to setup CSV file: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
-
-    def _close_csv_file(self):
-        if self.csv_file:
-            self.csv_file.close()
-            self.csv_file = None
         self.csv_writer = None
+        self.rec_path = None
+        self.rec_started = None
+        self.rec_rows = 0
+        self._last_flush = 0.0
+        self._reset_stats()
 
-    # ── parsers ───────────────────────────────────────────────────────────────
+    def _reset_stats(self):
+        self.connected_at = None
+        self.raw_lines = 0
+        self.bytes_total = 0
+        self.csi_frames = 0
+        self.espnow_packets = 0
+        self.parse_errors = 0
+        self.last_line_time = None
+        self.last_csi_time = None
+        self.byte_samples = deque(maxlen=2000)     # (time, nbytes)
+        self.tx = {}                               # {tx_id: stats dict}
+        self.diag = {}
+        self.role_votes = {'RECEIVER': 0, 'TRANSMITTER': 0, 'IDLE': 0}
 
-    def parse_csi_line(self, line):
-        match = CSI_REGEX.search(line)
-        if not match:
-            return None
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError as exc:
-            print(f"[ERROR] CSI JSON parse failed: {exc} | line={line}")
-            return None
-
-    def parse_espnow_line(self, line):
-        match = ESPNOW_REGEX.search(line)
-        if match:
-            try:
-                return {
-                    'seq': int(match.group(1)),
-                    'tx_id': 0,
-                    'rssi': int(match.group(2)),
-                    'esp_timestamp': int(match.group(3)),
-                }
-            except ValueError as e:
-                print(f"[ERROR] ESP-NOW parse failed: {e} | line={line}")
-                return None
-
-        match = ESPNOW_LOG_REGEX.search(line)
-        if match:
-            try:
-                return {
-                    'seq': int(match.group(1)),
-                    'tx_id': int(match.group(2)) if match.group(2) else 0,
-                    'rssi': int(match.group(3)),
-                    'esp_timestamp': 0,
-                }
-            except ValueError as e:
-                print(f"[ERROR] ESP-NOW log parse failed: {e} | line={line}")
-                return None
-
-        return None
-
-    def parse_csi_diag_line(self, line):
-        match = CSI_DIAG_REGEX.search(line)
-        if not match:
-            return None
-        try:
-            result = {
-                'callbacks': int(match.group(1)),
-                'matches': int(match.group(2)),
-                'zero_len': int(match.group(3)),
-                'queue_drop': int(match.group(4)),
-                'tx_counts': {},
-            }
-            for tx_match in TX_DIAG_REGEX.finditer(line):
-                result['tx_counts'][tx_match.group(1)] = int(tx_match.group(2))
-            return result
-        except ValueError as e:
-            print(f"[ERROR] CSI diag parse failed: {e} | line={line}")
-            return None
-
-    # ── packet processing ─────────────────────────────────────────────────────
-
-    def _process_packet(self, packet, packet_type='unknown'):
-        python_timestamp = datetime.datetime.now().isoformat()
-
-        tx_id = int(packet.get('tx_id', 0))
-
-        # Use ESP32 hardware timestamp (µs) so both TXs get the same group_id
-        # regardless of when Python dequeues them from the serial buffer.
-        esp_ts_us = int(packet.get('esp_timestamp', 0))
-        group_id = int((esp_ts_us / 1000) / GROUP_WINDOW_MS)
-
-        csi_data = packet.get('csi_data', [])
-        if isinstance(csi_data, str):
-            try:
-                csi_data = json.loads(csi_data)
-            except Exception:
-                csi_data = []
-
-        data_length = packet.get('data_length', len(csi_data) if isinstance(csi_data, list) else 0)
-
-        # seq correlation per TX
-        seq = packet.get('seq', '')
-        if packet_type == 'espnow':
-            if tx_id:
-                self.pending_seq_by_tx[tx_id] = seq
-                self.pending_seq_time_by_tx[tx_id] = time.time()
-            self.espnow_packet_count += 1
-        elif packet_type == 'csi':
-            if not seq and tx_id and tx_id in self.pending_seq_by_tx:
-                if time.time() - self.pending_seq_time_by_tx.get(tx_id, 0) <= 1.0:
-                    seq = self.pending_seq_by_tx[tx_id]
-            self.csi_packet_count += 1
-            self.last_csi_time = time.time()
-
-        # per-TX stats (works for any tx_id value, no hardcoding)
-        if tx_id not in self.tx_stats:
-            self.tx_stats[tx_id] = {'packet_count': 0, 'last_rssi': None, 'last_time': None}
-        self.tx_stats[tx_id]['packet_count'] += 1
-        self.tx_stats[tx_id]['last_rssi'] = packet.get('rssi', 0)
-        self.tx_stats[tx_id]['last_time'] = python_timestamp
-
-        row = {
-            'timestamp': python_timestamp,
-            'group_id': group_id,
-            'tx_id': tx_id,
-            'packet_type': packet_type,
-            'rssi': packet.get('rssi', 0),
-            'rate': packet.get('rate', 0),
-            'channel': packet.get('channel', 0),
-            'bandwidth': packet.get('bandwidth', 0),
-            'data_length': data_length,
-            'esp_timestamp': packet.get('esp_timestamp', 0),
-            'csi_data': json.dumps(csi_data) if csi_data else '[]',
-            'seq': seq,
-        }
-
-        should_write_csv = packet_type == 'csi' and data_length > 0
-        if self.csv_writer and should_write_csv:
-            try:
-                self.csv_writer.writerow(row)
-                self.csv_file.flush()
-            except Exception as exc:
-                print(f"[ERROR] Failed to write CSV row: {exc}")
-
-        self.packet_count += 1
-        self.last_packet_time = time.time()
-        self.last_packet_type = packet_type
-
-        elapsed = time.time() - self.session_start_time if self.session_start_time else 0
-        display_data = {
-            'packet_num': self.packet_count,
-            'timestamp': python_timestamp,
-            'tx_id': tx_id,
-            'group_id': group_id,
-            'rssi': packet.get('rssi', 0),
-            'rate': packet.get('rate', 0),
-            'channel': packet.get('channel', 0),
-            'bandwidth': packet.get('bandwidth', 0),
-            'data_length': data_length,
-            'esp_timestamp': packet.get('esp_timestamp', 0),
-            'seq': seq,
-            'packet_type': packet_type,
-            'time_passed': elapsed,
-        }
-
-        if isinstance(csi_data, list):
-            for idx, value in enumerate(csi_data):
-                display_data[f'subcarrier_{idx}'] = value
-                self.available_subcarriers.add(idx)
-
-        self.recent_data.append(display_data)
-        self.latest_by_tx[tx_id] = display_data
-
-        if tx_id not in self.plot_data_by_tx:
-            self.plot_data_by_tx[tx_id] = deque(maxlen=200)
-        self.plot_data_by_tx[tx_id].append({
-            'time': elapsed,
-            'rssi': packet.get('rssi', 0),
-            'subcarriers': csi_data if isinstance(csi_data, list) else [],
+    # ── logging into the in-memory console ──
+    def _add_log(self, kind, text):
+        self.last_log_id = next(self._log_ids)
+        self.logs.append({
+            'id': self.last_log_id,
+            'ts': datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3],
+            'kind': kind,
+            'text': text if len(text) <= 400 else text[:400] + ' …',
         })
 
-    # ── logging loop ──────────────────────────────────────────────────────────
+    def _tx(self, tx_id):
+        st = self.tx.get(tx_id)
+        if st is None:
+            st = self.tx[tx_id] = {
+                'frames': 0, 'espnow': 0, 'rssi': None, 'espnow_rssi': None,
+                'last_csi': None, 'last_espnow': None,
+                'channel': None, 'bandwidth': None, 'rate': None, 'data_length': None,
+                'last_seq': None, 'last_seq_time': 0.0,
+                'seq_received': 0, 'seq_missing': 0,
+                'csi_times': deque(maxlen=1000), 'espnow_times': deque(maxlen=1000),
+            }
+        return st
 
-    def _log_loop(self):
+    # ── connection lifecycle ──
+    def connect(self, port, baud=DEFAULT_BAUD, reset=False):
+        self.disconnect()
         try:
-            while self.is_running:
-                if self.serial_conn and self.serial_conn.in_waiting > 0:
-                    try:
-                        line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
-                        if line:
-                            self.raw_lines.append(line)
-                            self.raw_line_count += 1
-                            self.last_raw_line = line
-                            self.last_raw_line_time = time.time()
+            conn = open_serial(port, baud)
+        except (serial.SerialException, OSError, ValueError) as exc:
+            with self.lock:
+                self.error = friendly_serial_error(port, exc)
+            return False, self.error
 
-                            packet = self.parse_csi_line(line)
-                            packet_type = 'csi'
-                            if packet is None:
-                                packet = self.parse_espnow_line(line)
-                                packet_type = 'espnow'
+        try:
+            if reset:
+                # EN pulse via RTS (DTR stays low so GPIO0 is high -> normal boot)
+                conn.rts = True
+                time.sleep(0.12)
+                conn.rts = False
+            else:
+                conn.reset_input_buffer()
+        except Exception:
+            pass
 
-                            if packet is not None:
-                                self._process_packet(packet, packet_type=packet_type)
-                            else:
-                                diag = self.parse_csi_diag_line(line)
-                                if diag is not None:
-                                    self.csi_diag = diag
-                    except Exception as e:
-                        print(f"Error processing serial line: {e}")
-                        import traceback
-                        traceback.print_exc()
-                time.sleep(0.01)
-        except Exception as e:
-            print(f"Logging error: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.is_running = False
+        with self.lock:
+            self._reset_stats()
+            self.frames.clear()
+            self.logs.clear()
+            self.serial_conn = conn
+            self.port = port
+            self.baud = baud
+            self.error = None
+            self.conn_id += 1
+            self.connected_at = time.time()
+            self.stop_event = threading.Event()
+            self._add_log('info', f"Connected to {port} @ {baud} baud" + (" (board reset)" if reset else ""))
+            stop_event = self.stop_event
 
-    # ── lifecycle ─────────────────────────────────────────────────────────────
+        self.reader_thread = threading.Thread(
+            target=self._reader, args=(conn, stop_event), daemon=True, name='serial-reader')
+        self.reader_thread.start()
+        print(f"[web_app] connected to {port} @ {baud}")
+        return True, None
 
-    def start_logging(self):
-        if not self.serial_conn:
-            print("Not connected to ESP32")
-            return False
-        if self.is_running:
-            print("Already logging")
-            return False
-        self.is_running = True
-        self.session_start_time = time.time()
-        self.csv_filename = self.setup_csv_file()
-        self.logging_thread = threading.Thread(target=self._log_loop)
-        self.logging_thread.daemon = True
-        self.logging_thread.start()
-        return True
+    def disconnect(self):
+        self.stop_recording()
+        with self.lock:
+            conn = self.serial_conn
+            self.serial_conn = None
+            self.stop_event.set()
+            thread = self.reader_thread
+            self.reader_thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self.lock:
+                self._add_log('info', f"Disconnected from {self.port}")
+            print(f"[web_app] disconnected from {self.port}")
 
-    def stop_logging(self):
-        self.is_running = False
-        if self.logging_thread is not None:
-            self.logging_thread.join(timeout=1)
-            self.logging_thread = None
-        self._close_csv_file()
+    def _on_connection_lost(self, conn, exc):
+        with self.lock:
+            if self.serial_conn is not conn:
+                return
+            self.error = f"Serial connection to {self.port} was lost ({exc}). Is the cable unplugged?"
+            self._add_log('error', self.error)
+            self.serial_conn = None
+            self.stop_recording()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-    def close(self):
-        self.stop_logging()
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
-        self.serial_conn = None
+    # ── reader thread ──
+    def _reader(self, conn, stop_event):
+        buf = b''
+        while not stop_event.is_set():
+            try:
+                waiting = conn.in_waiting
+                chunk = conn.read(min(max(waiting, 1), 16384))
+            except (serial.SerialException, OSError, TypeError, AttributeError) as exc:
+                if not stop_event.is_set():
+                    self._on_connection_lost(conn, exc)
+                return
+            if not chunk:
+                continue
+            now = time.time()
+            with self.lock:
+                self.bytes_total += len(chunk)
+                self.byte_samples.append((now, len(chunk)))
+            buf += chunk
+            if b'\n' not in buf:
+                if len(buf) > 65536:          # garbage without newlines (wrong baud?)
+                    buf = buf[-4096:]
+                continue
+            *lines, buf = buf.split(b'\n')
+            for raw in lines:
+                line = raw.decode('utf-8', errors='ignore').replace('\x00', '').strip()
+                if not line:
+                    continue
+                try:
+                    self._handle_line(line, now)
+                except Exception as exc:
+                    with self.lock:
+                        self.parse_errors += 1
+                        self._add_log('error', f"Line handling failed: {exc}")
 
-    # ── data accessors ────────────────────────────────────────────────────────
+    def _handle_line(self, line, now):
+        clean = ANSI_REGEX.sub('', line)
+        with self.lock:
+            self.raw_lines += 1
+            self.last_line_time = now
+            role = guess_role(clean)
+            if role:
+                self.role_votes[role] += 1
 
-    def get_status(self):
+            m = CSI_REGEX.search(clean)
+            if m:
+                try:
+                    pkt = json.loads(m.group(1))
+                except json.JSONDecodeError:
+                    self.parse_errors += 1
+                    self._add_log('error', 'Malformed CSI line: ' + clean[:160])
+                    return
+                self._on_csi(pkt, now)
+                return
+
+            m = ESPNOW_RX_REGEX.search(clean)
+            if m:
+                self._on_espnow(int(m.group(1)), int(m.group(2) or 0), int(m.group(3)), now)
+                self._add_log('espnow', clean)
+                return
+
+            m = ESPNOW_LEGACY_REGEX.search(clean)
+            if m:
+                self._on_espnow(int(m.group(1)), 0, int(m.group(2)), now)
+                self._add_log('espnow', clean)
+                return
+
+            m = CSI_DIAG_REGEX.search(clean)
+            if m:
+                self.diag = {
+                    'callbacks': int(m.group(1)),
+                    'matches': int(m.group(2)),
+                    'zero_len': int(m.group(3)),
+                    'queue_drop': int(m.group(4)),
+                    'tx_counts': {t: int(n) for t, n in TX_DIAG_REGEX.findall(clean)},
+                    'age_ref': now,
+                }
+                self._add_log('diag', clean)
+                return
+
+            if clean.startswith('E (') or 'Guru Meditation' in clean or 'abort()' in clean:
+                kind = 'error'
+            elif clean.startswith('W ('):
+                kind = 'warn'
+            else:
+                kind = 'other'
+            self._add_log(kind, clean)
+
+    def _on_espnow(self, seq, tx_id, rssi, now):
+        st = self._tx(tx_id)
+        st['espnow'] += 1
+        st['espnow_rssi'] = rssi
+        st['last_espnow'] = now
+        st['espnow_times'].append(now)
+        self.espnow_packets += 1
+        if st['last_seq'] is not None:
+            gap = seq - st['last_seq']
+            if 1 < gap < 1000:
+                st['seq_missing'] += gap - 1
+            elif gap <= 0 or gap >= 1000:     # transmitter rebooted -> restart stats
+                st['seq_missing'] = 0
+                st['seq_received'] = 0
+        st['seq_received'] += 1
+        st['last_seq'] = seq
+        st['last_seq_time'] = now
+
+    def _on_csi(self, pkt, now):
+        tx_id = int(pkt.get('tx_id', 0) or 0)
+        csi = pkt.get('csi_data') or []
+        if isinstance(csi, str):
+            try:
+                csi = json.loads(csi)
+            except Exception:
+                csi = []
+        data_length = int(pkt.get('data_length', len(csi)) or 0)
+        rssi = int(pkt.get('rssi', 0) or 0)
+        esp_ts = int(pkt.get('esp_timestamp', 0) or 0)
+        # ESP32 hardware timestamp (us) -> frames of different TXs in the same
+        # send window get the same group_id regardless of serial ordering.
+        group_id = int((esp_ts / 1000) / GROUP_WINDOW_MS)
+
+        st = self._tx(tx_id)
+        st['frames'] += 1
+        st['rssi'] = rssi
+        st['last_csi'] = now
+        st['csi_times'].append(now)
+        st['channel'] = pkt.get('channel')
+        st['bandwidth'] = pkt.get('bandwidth')
+        st['rate'] = pkt.get('rate')
+        st['data_length'] = data_length
+        self.csi_frames += 1
+        self.last_csi_time = now
+
+        # correlate with the most recent ESP-NOW sequence number of this TX
+        seq = st['last_seq'] if (st['last_seq'] is not None and now - st['last_seq_time'] <= 1.0) else ''
+
+        if self.csv_writer is not None and data_length > 0:
+            try:
+                self.csv_writer.writerow({
+                    'timestamp': datetime.datetime.fromtimestamp(now).isoformat(),
+                    'group_id': group_id,
+                    'tx_id': tx_id,
+                    'packet_type': 'csi',
+                    'rssi': rssi,
+                    'rate': pkt.get('rate', 0),
+                    'channel': pkt.get('channel', 0),
+                    'bandwidth': pkt.get('bandwidth', 0),
+                    'data_length': data_length,
+                    'esp_timestamp': esp_ts,
+                    'csi_data': json.dumps(csi),
+                    'seq': seq,
+                })
+                self.rec_rows += 1
+                if now - self._last_flush > 0.5:
+                    self.csv_file.flush()
+                    self._last_flush = now
+            except Exception as exc:
+                self.error = f"Writing CSV failed: {exc}"
+                self._add_log('error', self.error)
+                self.stop_recording()
+
+        self.last_frame_id = next(self._frame_ids)
+        self.frames.append({
+            'id': self.last_frame_id,
+            't': round(now - self.connected_at, 3),
+            'tx': tx_id,
+            'rssi': rssi,
+            'amp': csi_amplitudes(csi),
+        })
+        self._add_log('csi', f"CSI  tx={tx_id} rssi={rssi} rate={pkt.get('rate')} "
+                             f"ch={pkt.get('channel')} bw={pkt.get('bandwidth')} len={data_length} grp={group_id}")
+
+    # ── recording ──
+    def start_recording(self):
+        with self.lock:
+            if self.serial_conn is None:
+                return False, 'Connect to the receiver first.'
+            if self.csv_writer is not None:
+                return True, None
+            session_dir = os.path.join(SESSIONS_DIR, f"session-{uuid.uuid4().hex[:8]}")
+            path = os.path.join(session_dir, f"csi_data_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv")
+            try:
+                os.makedirs(session_dir, exist_ok=True)
+                f = open(path, 'w', newline='', encoding='utf-8')
+                writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+                writer.writeheader()
+                f.flush()
+            except OSError as exc:
+                return False, f"Could not create CSV file: {exc}"
+            self.csv_file, self.csv_writer = f, writer
+            self.rec_path, self.rec_started, self.rec_rows = path, time.time(), 0
+            self._add_log('info', f"Recording to {os.path.relpath(path, BASE_DIR)}")
+            print(f"[web_app] recording to {path}")
+            return True, None
+
+    def stop_recording(self):
+        with self.lock:
+            if self.csv_file is None:
+                return None
+            info = {'path': os.path.relpath(self.rec_path, BASE_DIR).replace('\\', '/'),
+                    'rows': self.rec_rows}
+            try:
+                self.csv_file.flush()
+                self.csv_file.close()
+            except Exception:
+                pass
+            self._add_log('info', f"Recording saved: {info['path']} ({info['rows']} frames)")
+            print(f"[web_app] recording saved: {self.rec_path} ({self.rec_rows} frames)")
+            self.csv_file = self.csv_writer = None
+            self.rec_path = self.rec_started = None
+            self.rec_rows = 0
+            return info
+
+    # ── snapshot for the browser ──
+    @staticmethod
+    def _since(buf, since, initial):
+        """Items of an id-ordered deque newer than `since` (ids are consecutive)."""
+        if not buf:
+            return []
+        first, last = buf[0]['id'], buf[-1]['id']
+        if since < 0 or since > last:                 # new tab / server restarted
+            start = max(0, len(buf) - initial)
+        else:
+            start = max(0, since - first + 1)
+        return list(itertools.islice(buf, start, None))
+
+    def snapshot(self, since=-1, log_since=-1):
         now = time.time()
-        csi_age = round(now - self.last_csi_time, 2) if self.last_csi_time else None
-        raw_age = round(now - self.last_raw_line_time, 2) if self.last_raw_line_time else None
+        with self.lock:
+            connected = self.serial_conn is not None
+            uptime = (now - self.connected_at) if self.connected_at else 0.0
+            window = max(0.5, min(RATE_WINDOW_S, uptime)) if uptime else RATE_WINDOW_S
+            cutoff = now - window
+            bps = sum(n for t, n in self.byte_samples if t >= cutoff) / window
+            capacity = self.baud / 10.0           # 8N1 -> 10 bits per byte
 
-        return {
-            'connected': self.serial_conn is not None and self.serial_conn.is_open,
-            'logging': self.is_running,
-            'packet_count': self.packet_count,
-            'raw_line_count': self.raw_line_count,
-            'csi_packet_count': self.csi_packet_count,
-            'espnow_packet_count': self.espnow_packet_count,
-            'last_packet_type': self.last_packet_type,
-            'serial_receiving': self.last_raw_line_time is not None and (now - self.last_raw_line_time) <= 3,
-            'last_raw_seconds_ago': raw_age,
-            'last_raw_line': self.last_raw_line,
-            'csi_receiving': self.last_csi_time is not None and (now - self.last_csi_time) <= 3,
-            'last_csi_seconds_ago': csi_age,
-            'csi_diag': self.csi_diag,
-            'tx_stats': {str(k): v for k, v in self.tx_stats.items()},
-            'observed_tx_ids': sorted(str(k) for k in self.tx_stats),
-            'port': self.port,
-            'session_id': self.session_id,
-            'session_dir': self.session_dir,
-        }
+            tx_list = []
+            for tx_id in sorted(self.tx):
+                st = self.tx[tx_id]
+                seen = [t for t in (st['last_csi'], st['last_espnow']) if t]
+                total_seq = st['seq_received'] + st['seq_missing']
+                tx_list.append({
+                    'id': tx_id,
+                    'frames': st['frames'],
+                    'espnow': st['espnow'],
+                    'rssi': st['rssi'] if st['rssi'] is not None else st['espnow_rssi'],
+                    'csi_hz': round(sum(1 for t in st['csi_times'] if t >= cutoff) / window, 2),
+                    'espnow_hz': round(sum(1 for t in st['espnow_times'] if t >= cutoff) / window, 2),
+                    'last_seen_age': round(now - max(seen), 2) if seen else None,
+                    'last_csi_age': round(now - st['last_csi'], 2) if st['last_csi'] else None,
+                    'channel': st['channel'],
+                    'bandwidth': st['bandwidth'],
+                    'rate': st['rate'],
+                    'data_length': st['data_length'],
+                    'loss_pct': round(100.0 * st['seq_missing'] / total_seq, 1) if total_seq else None,
+                })
 
-    def get_recent_data(self):
-        return list(self.recent_data)
+            votes = self.role_votes
+            role_guess = max(votes, key=votes.get) if any(votes.values()) else None
+            diag = dict(self.diag)
+            if diag:
+                diag['age'] = round(now - diag.pop('age_ref'), 1)
 
-    def get_latest_by_tx(self):
-        return {str(k): v for k, v in self.latest_by_tx.items()}
+            status = {
+                'instance': INSTANCE_ID,
+                'conn_id': self.conn_id,
+                'connected': connected,
+                'port': self.port,
+                'baud': self.baud,
+                'error': self.error,
+                'uptime': round(uptime, 3),
+                'raw_lines': self.raw_lines,
+                'bytes_total': self.bytes_total,
+                'csi_frames': self.csi_frames,
+                'espnow_packets': self.espnow_packets,
+                'parse_errors': self.parse_errors,
+                'serial_live': bool(self.last_line_time and now - self.last_line_time <= 3),
+                'last_line_age': round(now - self.last_line_time, 1) if self.last_line_time else None,
+                'csi_live': bool(self.last_csi_time and now - self.last_csi_time <= 3),
+                'last_csi_age': round(now - self.last_csi_time, 1) if self.last_csi_time else None,
+                'csi_hz': round(sum(t['csi_hz'] for t in tx_list), 2),
+                'bytes_per_s': round(bps, 1),
+                'uart_load': round(bps / capacity, 3) if capacity else 0,
+                'role_guess': role_guess,
+                'recording': {
+                    'active': self.csv_writer is not None,
+                    'path': os.path.relpath(self.rec_path, BASE_DIR).replace('\\', '/') if self.rec_path else None,
+                    'rows': self.rec_rows,
+                    'elapsed': round(now - self.rec_started, 1) if self.rec_started else 0,
+                },
+            }
+            return {
+                'status': status,
+                'tx': tx_list,
+                'diag': diag,
+                'frames': self._since(self.frames, since, INITIAL_FRAMES),
+                'last_frame_id': self.last_frame_id,
+                'logs': self._since(self.logs, log_since, 300),
+                'last_log_id': self.last_log_id,
+            }
 
-    def get_available_subcarriers(self):
-        return sorted(self.available_subcarriers)
-
-    def get_raw_lines(self):
-        return list(self.raw_lines)
-
-    def get_plot_data(self, selected_subcarriers=None, tx_filter=None):
-        """
-        Returns {x, y} point arrays so Chart.js can plot multiple TX series
-        on a common time axis without alignment gymnastics.
-
-        tx_filter: None = show all TXs, int = show only that TX.
-        """
-        if selected_subcarriers is None:
-            selected_subcarriers = [1, 5, 9, 13]
-        selected_subcarriers = sorted(set(int(x) for x in selected_subcarriers))
-
-        tx_ids = sorted(self.plot_data_by_tx.keys())
-        if tx_filter is not None:
-            tx_ids = [t for t in tx_ids if t == int(tx_filter)]
-
-        rssi_by_tx = {}
-        subcarriers = {}
-
-        for tx_id in tx_ids:
-            tx_key = str(tx_id)
-            rssi_by_tx[tx_key] = []
-
-            for point in list(self.plot_data_by_tx[tx_id])[-200:]:
-                t = round(point['time'], 3)
-                rssi_by_tx[tx_key].append({'x': t, 'y': point['rssi']})
-
-                for idx in selected_subcarriers:
-                    values = point.get('subcarriers', [])
-                    if idx < len(values):
-                        sub_key = f'TX{tx_id} sub{idx}'
-                        if sub_key not in subcarriers:
-                            subcarriers[sub_key] = []
-                        subcarriers[sub_key].append({'x': t, 'y': values[idx]})
-
-        return {'rssi_by_tx': rssi_by_tx, 'subcarriers': subcarriers}
-
-
-# ── global logger ─────────────────────────────────────────────────────────────
-
-logger = None
-
-
-def cleanup_logger():
-    global logger
-    if logger:
-        logger.close()
-        logger = None
+    def role_summary(self):
+        with self.lock:
+            votes = self.role_votes
+            return {
+                'role': max(votes, key=votes.get) if any(votes.values()) else None,
+                'csi': self.csi_frames,
+                'lines': self.raw_lines,
+            }
 
 
-def _handle_shutdown(signum, frame):
-    cleanup_logger()
-    raise SystemExit(0)
+monitor = CSIMonitor()
+atexit.register(monitor.disconnect)
 
 
-atexit.register(cleanup_logger)
-signal.signal(signal.SIGINT, _handle_shutdown)
-signal.signal(signal.SIGTERM, _handle_shutdown)
+# ── port discovery ───────────────────────────────────────────────────────────
 
-# ── HTML/JS ───────────────────────────────────────────────────────────────────
+def list_ports():
+    cfg = load_config_roles()
+    ports = []
+    for p in serial.tools.list_ports.comports():
+        roles = cfg.get(p.device, set())
+        cfg_role = 'RECEIVER' if 'RECEIVER' in roles else (sorted(roles)[0] if roles else None)
+        ports.append({
+            'device': p.device,
+            'description': p.description or '',
+            'usb': p.vid is not None,          # Bluetooth/virtual ports have no VID
+            'config_role': cfg_role,
+        })
+    ports.sort(key=lambda d: (not d['usb'], _port_sort_key(d['device'])))
+
+    suggested = None
+    with monitor.lock:
+        if monitor.serial_conn is not None:
+            suggested = monitor.port
+    if suggested is None:
+        for p in ports:
+            if p['usb'] and p['config_role'] == 'RECEIVER':
+                suggested = p['device']
+                break
+    if suggested is None:
+        suggested = next((p['device'] for p in ports if p['usb']), ports[0]['device'] if ports else None)
+    return {'ports': ports, 'suggested': suggested}
+
+
+def probe_port(device, duration=1.6):
+    """Passively listen on a port (no reset, no writes) and guess the board role."""
+    result = {'role': None, 'csi': 0, 'lines': 0, 'error': None}
+    try:
+        s = open_serial(device, DEFAULT_BAUD)
+    except (serial.SerialException, OSError, ValueError) as exc:
+        result['error'] = 'busy' if 'denied' in str(exc).lower() or 'permission' in str(exc).lower() \
+            else str(exc)
+        return result
+    buf = b''
+    try:
+        t_end = time.time() + duration
+        while time.time() < t_end:
+            n = s.in_waiting
+            buf += s.read(n) if n else b''
+            if not n:
+                time.sleep(0.02)
+    except Exception as exc:
+        result['error'] = str(exc)
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    text = ANSI_REGEX.sub('', buf.decode('utf-8', errors='ignore'))
+    result['lines'] = text.count('\n')
+    result['csi'] = text.count('CSI_START')
+    result['role'] = guess_role(text)
+    return result
+
+
+def probe_ports():
+    with monitor.lock:
+        own_port = monitor.port if monitor.serial_conn is not None else None
+    devices = [p.device for p in serial.tools.list_ports.comports() if p.vid is not None]
+    results, threads = {}, []
+
+    def worker(dev):
+        results[dev] = probe_port(dev)
+
+    for dev in devices:
+        if dev == own_port:
+            results[dev] = dict(monitor.role_summary(), error=None, connected=True)
+            continue
+        t = threading.Thread(target=worker, args=(dev,), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=4)
+    return results
+
+
+def list_recordings(limit=40):
+    files = glob.glob(os.path.join(SESSIONS_DIR, '**', '*.csv'), recursive=True)
+    files.sort(key=os.path.getmtime, reverse=True)
+    out = []
+    for path in files[:limit]:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        out.append({
+            'path': os.path.relpath(path, SESSIONS_DIR).replace('\\', '/'),
+            'name': os.path.basename(path),
+            'session': os.path.basename(os.path.dirname(path)),
+            'size': st.st_size,
+            'mtime': datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+        })
+    return out
+
+
+# ── Flask app ────────────────────────────────────────────────────────────────
+
+app = Flask(__name__, static_folder=STATIC_DIR, static_url_path='/static')
+logging.getLogger('werkzeug').setLevel(logging.WARNING)   # no per-request spam
+
 
 @app.route('/')
 def home():
-    return '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>ESP32 CSI Data Monitor</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
-    <style>
-        :root {
-            --primary: #36311F;
-            --secondary: #59544B;
-            --accent: #79A9D1;
-            --success: #7D8CA3;
-            --light-bg: #F5F6F8;
-            --dark-text: #36311F;
-            --white: #ffffff;
-        }
-        body {
-            font-family: 'IBM Plex Mono', monospace;
-            margin: 0; padding: 20px;
-            background: var(--light-bg);
-            color: var(--dark-text);
-        }
-        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
-        h1 {
-            color: var(--primary); font-size: 2em; text-align: center;
-            font-weight: 700; text-transform: uppercase; letter-spacing: 2px;
-            margin-bottom: 1.5em;
-        }
-        h3 {
-            color: var(--primary); font-size: 1.2em; font-weight: 600;
-            text-transform: uppercase; letter-spacing: 1px; margin-bottom: 1em;
-        }
-        .card {
-            background: var(--white); padding: 25px; margin: 20px 0;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            border-left: 4px solid var(--accent);
-        }
-        .status { display: flex; gap: 15px; align-items: center; flex-wrap: wrap; margin-bottom: 20px; }
-        .status-item {
-            padding: 10px 18px; font-weight: 600; font-size: 0.9em;
-            text-transform: uppercase; letter-spacing: 1px; color: var(--white);
-        }
-        .connected    { background: var(--accent); }
-        .disconnected { background: var(--primary); }
-        .logging      { background: var(--success); }
-        .stopped      { background: var(--secondary); }
-        .csi-live     { background: #2d6a4f; }
-        .csi-waiting  { background: #b08968; }
-        .serial-live  { background: #457b9d; }
-        .serial-waiting { background: #8d99ae; }
-        button {
-            padding: 10px 20px; margin: 4px; border: none; cursor: pointer;
-            font-size: 0.9em; font-weight: 600; text-transform: uppercase;
-            letter-spacing: 1px; font-family: inherit;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-        }
-        .btn-primary { background: var(--accent);   color: var(--white); }
-        .btn-success { background: var(--success);  color: var(--white); }
-        .btn-danger  { background: var(--primary);  color: var(--white); }
-        .btn-warning { background: var(--secondary);color: var(--white); }
-        input[type="text"], select {
-            padding: 9px 14px; border: 2px solid var(--accent);
-            font-size: 0.9em; font-family: inherit;
-        }
-        /* TX cards inside "Latest CSI Data" */
-        .tx-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-        .tx-card {
-            border-left: 5px solid var(--accent);
-            background: var(--light-bg); padding: 16px;
-        }
-        .tx-card.tx-1 { border-left-color: rgb(54,162,235); }
-        .tx-card.tx-2 { border-left-color: rgb(255,99,132); }
-        .tx-card.tx-3 { border-left-color: rgb(75,192,192); }
-        .tx-card.tx-4 { border-left-color: rgb(255,205,86); }
-        .tx-badge {
-            display: inline-block; padding: 3px 10px; color: var(--white);
-            font-weight: 700; font-size: 0.85em; margin-bottom: 10px;
-        }
-        .tx-card.tx-1 .tx-badge { background: rgb(54,162,235); }
-        .tx-card.tx-2 .tx-badge { background: rgb(255,99,132); }
-        .tx-card.tx-3 .tx-badge { background: rgb(75,192,192); }
-        .tx-card.tx-4 .tx-badge { background: rgb(255,205,86); }
-        .tx-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin-top: 8px; }
-        .data-item {
-            background: var(--white); padding: 10px 12px;
-            font-size: 0.88em; border-left: 3px solid var(--accent);
-        }
-        /* diagnostics */
-        .diag-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
-        /* plots */
-        .plots-container { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; }
-        .chart-container {
-            height: 380px; background: var(--white); padding: 16px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-left: 4px solid var(--accent);
-        }
-        .plot-controls {
-            display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
-            background: var(--light-bg); padding: 14px; margin-bottom: 16px;
-            border-left: 4px solid var(--accent);
-        }
-        .control-group { display: flex; align-items: center; gap: 8px; }
-        .subcarrier-browser {
-            width: 100%; max-height: 180px; overflow-y: auto;
-            background: var(--white); border: 1px solid #d8dee6;
-            padding: 12px; display: flex; flex-wrap: wrap; gap: 7px;
-        }
-        .subcarrier-chip {
-            border: 1px solid var(--accent); background: var(--white);
-            color: var(--dark-text); padding: 6px 9px; font-size: 0.82em;
-            cursor: pointer; user-select: none; font-family: inherit;
-        }
-        .subcarrier-chip.pending  { background: #f4d58d; border-color: #d4a373; }
-        .subcarrier-chip.selected { background: var(--accent); color: var(--white); }
-        .subcarrier-status { width: 100%; font-size: 0.88em; color: var(--secondary); }
-        #data-log {
-            height: 260px; overflow-y: scroll; border: 1px solid #ddd;
-            padding: 12px; background: var(--light-bg); font-size: 0.88em;
-        }
-        .log-entry { margin-bottom: 4px; }
-        .log-tx-badge {
-            display: inline-block; padding: 1px 6px; color: var(--white);
-            font-weight: 700; font-size: 0.8em; margin-right: 5px;
-        }
-        .log-tx-1 { background: rgb(54,162,235); }
-        .log-tx-2 { background: rgb(255,99,132); }
-        .log-tx-3 { background: rgb(75,192,192); }
-        @media (max-width: 1100px) {
-            .plots-container { grid-template-columns: 1fr; }
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <h1>ESP32 Real-Time CSI Monitor</h1>
+    resp = send_from_directory(STATIC_DIR, 'dashboard.html', max_age=0)
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
-    <!-- Connection -->
-    <div class="card">
-        <h3>Connection</h3>
-        <div class="status" id="status">
-            <div class="status-item disconnected">Disconnected</div>
-            <div class="status-item stopped">Not Logging</div>
-            <div class="status-item serial-waiting">Serial Waiting</div>
-            <div class="status-item csi-waiting">CSI Waiting</div>
-        </div>
-        <div>
-            <input type="text" id="port-input" placeholder="COM9 (slave/RX)" style="width:200px">
-            <button class="btn-primary"  onclick="connect()">Connect</button>
-            <button class="btn-danger"   onclick="disconnect()">Disconnect</button>
-            <button class="btn-success"  onclick="startLogging()">Start Logging</button>
-            <button class="btn-warning"  onclick="stopLogging()">Stop Logging</button>
-        </div>
-    </div>
 
-    <!-- Latest per-TX -->
-    <div class="card">
-        <h3>Latest CSI Data (per TX)</h3>
-        <div class="tx-grid" id="latest-data">
-            <div class="data-item">Waiting for CSI data...</div>
-        </div>
-    </div>
+@app.route('/api/poll')
+def api_poll():
+    since = request.args.get('since', default=-1, type=int)
+    log_since = request.args.get('log_since', default=-1, type=int)
+    return jsonify(monitor.snapshot(since, log_since))
 
-    <!-- Diagnostics -->
-    <div class="card">
-        <h3>Diagnostics</h3>
-        <div class="diag-grid" id="serial-diagnostics">
-            <div class="data-item">Waiting...</div>
-        </div>
-    </div>
-
-    <!-- Plots -->
-    <div class="card">
-        <h3>Real-time Plots</h3>
-        <div class="plot-controls">
-            <div class="control-group">
-                <label for="tx-filter"><strong>CSI TX:</strong></label>
-                <select id="tx-filter" onchange="updateCharts()">
-                    <option value="">All TXs</option>
-                </select>
-            </div>
-            <div class="control-group">
-                <label><strong>Subcarriers:</strong></label>
-                <button class="btn-primary" onclick="addPendingSubcarriers()">Add</button>
-                <button class="btn-primary" onclick="refreshSubcarriers()">Refresh</button>
-            </div>
-            <div id="subcarrier-status" class="subcarrier-status">Click subcarriers to stage them, then press Add.</div>
-            <div id="subcarrier-browser" class="subcarrier-browser">
-                <div>Waiting for discovered subcarriers...</div>
-            </div>
-        </div>
-        <div class="plots-container">
-            <div class="chart-container"><canvas id="rssiChart"></canvas></div>
-            <div class="chart-container"><canvas id="csiChart"></canvas></div>
-        </div>
-    </div>
-
-    <!-- Log -->
-    <div class="card">
-        <h3>Data Log</h3>
-        <div id="data-log"></div>
-    </div>
-</div>
-
-<script>
-// ── TX colour palette (extensible: index = tx_id - 1) ─────────────────────────
-const TX_PALETTE = [
-    { border: 'rgb(54,162,235)',  bg: 'rgba(54,162,235,0.2)'  },  // TX1 blue
-    { border: 'rgb(255,99,132)', bg: 'rgba(255,99,132,0.2)'  },  // TX2 red
-    { border: 'rgb(75,192,192)', bg: 'rgba(75,192,192,0.2)'  },  // TX3 teal
-    { border: 'rgb(255,205,86)', bg: 'rgba(255,205,86,0.2)'  },  // TX4 yellow
-    { border: 'rgb(153,102,255)',bg: 'rgba(153,102,255,0.2)' },
-    { border: 'rgb(255,159,64)', bg: 'rgba(255,159,64,0.2)'  },
-];
-function txColor(txId) {
-    return TX_PALETTE[(parseInt(txId, 10) - 1) % TX_PALETTE.length] || TX_PALETTE[0];
-}
-
-// CSI subcarrier colour palette (cycles independently of TX)
-const SUB_PALETTE = [
-    'rgb(54,162,235)', 'rgb(255,99,132)', 'rgb(75,192,192)',
-    'rgb(255,205,86)', 'rgb(153,102,255)', 'rgb(255,159,64)',
-    'rgb(201,203,207)', 'rgb(100,221,23)', 'rgb(0,188,212)',
-];
-
-// ── chart setup (linear x = seconds since session start) ─────────────────────
-const CHART_OPTS = (title, yLabel) => ({
-    responsive: true,
-    maintainAspectRatio: false,
-    animation: { duration: 0 },
-    plugins: {
-        title: { display: true, text: title },
-        legend: { position: 'top' },
-    },
-    scales: {
-        x: { type: 'linear', title: { display: true, text: 'Time (s)' } },
-        y: { title: { display: true, text: yLabel } },
-    },
-});
-
-const rssiChart = new Chart(document.getElementById('rssiChart'), {
-    type: 'line',
-    data: { datasets: [] },
-    options: CHART_OPTS('RSSI over Time (per TX)', 'RSSI (dBm)'),
-});
-
-const hiddenCsiSeries = new Set();
-const csiChart = new Chart(document.getElementById('csiChart'), {
-    type: 'line',
-    data: { datasets: [] },
-    options: {
-        ...CHART_OPTS('CSI Subcarriers', 'CSI Value'),
-        plugins: {
-            ...CHART_OPTS('CSI Subcarriers', 'CSI Value').plugins,
-            legend: {
-                onClick: (e, item, legend) => {
-                    const ds = legend.chart.data.datasets[item.datasetIndex];
-                    if (!ds) return;
-                    if (hiddenCsiSeries.has(ds.label)) {
-                        hiddenCsiSeries.delete(ds.label);
-                        ds.hidden = false;
-                    } else {
-                        hiddenCsiSeries.add(ds.label);
-                        ds.hidden = true;
-                    }
-                    legend.chart.update();
-                },
-            },
-        },
-    },
-});
-
-// ── subcarrier browser ────────────────────────────────────────────────────────
-const customSubcarriers = new Set();
-const pendingSubcarriers = new Set();
-
-function renderSubcarrierStatus() {
-    const el = document.getElementById('subcarrier-status');
-    if (!el) return;
-    el.textContent = pendingSubcarriers.size === 0
-        ? 'Click subcarriers to stage them, then press Add.'
-        : `Staged: ${[...pendingSubcarriers].sort((a,b)=>a-b).join(', ')}`;
-}
-
-function renderSubcarrierBrowser(all = []) {
-    const el = document.getElementById('subcarrier-browser');
-    if (!el) return;
-    if (!all.length) { el.innerHTML = '<div>Waiting for discovered subcarriers...</div>'; return; }
-    el.innerHTML = '';
-    all.forEach(v => {
-        const chip = document.createElement('button');
-        chip.type = 'button';
-        const isPending  = pendingSubcarriers.has(v);
-        const isSelected = customSubcarriers.has(v);
-        chip.className = `subcarrier-chip${isPending ? ' pending' : ''}${isSelected ? ' selected' : ''}`;
-        chip.textContent = `SC${v}`;
-        chip.onclick = () => {
-            if (isSelected) {
-                customSubcarriers.delete(v);
-                hiddenCsiSeries.delete(`subcarrier_${v}`);
-                updateCharts();
-            } else if (isPending) {
-                pendingSubcarriers.delete(v);
-            } else {
-                pendingSubcarriers.add(v);
-            }
-            renderSubcarrierStatus();
-            renderSubcarrierBrowser(all);
-        };
-        el.appendChild(chip);
-    });
-}
-
-function addPendingSubcarriers() {
-    if (!pendingSubcarriers.size) return;
-    pendingSubcarriers.forEach(v => customSubcarriers.add(v));
-    pendingSubcarriers.clear();
-    renderSubcarrierStatus();
-    refreshSubcarriers();
-}
-
-function getSelectedSubcarriers() {
-    const sel = [...customSubcarriers].sort((a,b)=>a-b);
-    return sel.length ? sel : [1,5,9,13];
-}
-
-function refreshSubcarriers() {
-    fetch('/api/subcarriers')
-        .then(r => r.json())
-        .then(data => {
-            const merged = [...new Set([...data, ...customSubcarriers, ...pendingSubcarriers])].sort((a,b)=>a-b);
-            if (!customSubcarriers.size) {
-                [1,5,9,13].forEach(i => { if (merged.includes(i)) customSubcarriers.add(i); });
-            }
-            renderSubcarrierStatus();
-            renderSubcarrierBrowser(merged);
-            updateCharts();
-        })
-        .catch(e => console.error('subcarriers:', e));
-}
-
-// ── chart update ──────────────────────────────────────────────────────────────
-function updateCharts() {
-    const selected = getSelectedSubcarriers();
-    const txFilter = document.getElementById('tx-filter').value;
-    const params = `subcarriers=${selected.join(',')}&tx=${txFilter}`;
-
-    fetch('/api/plot_data?' + params)
-        .then(r => r.json())
-        .then(data => {
-            // RSSI chart: one dataset per TX, {x,y} points
-            rssiChart.data.datasets = Object.entries(data.rssi_by_tx || {}).map(([txId, pts]) => {
-                const c = txColor(txId);
-                return {
-                    label: `TX${txId} RSSI`,
-                    data: pts,
-                    borderColor: c.border,
-                    backgroundColor: c.bg,
-                    tension: 0.1,
-                    pointRadius: 0,
-                    pointHoverRadius: 3,
-                    borderWidth: 2,
-                };
-            });
-            rssiChart.update('none');
-
-            // CSI chart: one dataset per "TX{N} sub{idx}" key, {x,y} points
-            csiChart.data.datasets = Object.entries(data.subcarriers || {}).map(([key, pts], i) => {
-                const color = SUB_PALETTE[i % SUB_PALETTE.length];
-                return {
-                    label: key,
-                    data: pts,
-                    borderColor: color,
-                    backgroundColor: color.replace('rgb', 'rgba').replace(')', ',0.2)'),
-                    tension: 0.1,
-                    pointRadius: 0,
-                    pointHoverRadius: 3,
-                    borderWidth: 2,
-                    hidden: hiddenCsiSeries.has(key),
-                };
-            });
-            csiChart.update('none');
-        })
-        .catch(e => console.error('plot_data:', e));
-}
-
-// ── TX filter dropdown ────────────────────────────────────────────────────────
-let knownTxIds = new Set();
-
-function syncTxFilter(observedIds) {
-    const sel = document.getElementById('tx-filter');
-    const current = sel.value;
-    const incoming = new Set(observedIds);
-    let changed = false;
-    incoming.forEach(id => {
-        if (!knownTxIds.has(id)) {
-            knownTxIds.add(id);
-            const opt = document.createElement('option');
-            opt.value = id;
-            opt.textContent = `TX${id} only`;
-            sel.appendChild(opt);
-            changed = true;
-        }
-    });
-    if (changed && current !== '') sel.value = current;
-}
-
-// ── status ────────────────────────────────────────────────────────────────────
-function updateStatus() {
-    fetch('/api/status')
-        .then(r => r.json())
-        .then(data => {
-            const connClass   = data.connected        ? 'connected'     : 'disconnected';
-            const connText    = data.connected        ? 'Connected'     : 'Disconnected';
-            const logClass    = data.logging          ? 'logging'       : 'stopped';
-            const logText     = data.logging          ? 'Logging'       : 'Not Logging';
-            const serClass    = data.serial_receiving ? 'serial-live'   : 'serial-waiting';
-            const serText     = data.serial_receiving ? 'Serial Live'   : 'Serial Waiting';
-            const serAge      = data.last_raw_seconds_ago == null ? '—' : `${data.last_raw_seconds_ago}s ago`;
-            const csiClass    = data.csi_receiving    ? 'csi-live'      : 'csi-waiting';
-            const csiText     = data.csi_receiving    ? 'CSI Live'      : 'CSI Waiting';
-            const csiAge      = data.last_csi_seconds_ago == null ? '—' : `${data.last_csi_seconds_ago}s ago`;
-
-            document.getElementById('status').innerHTML = `
-                <div class="status-item ${connClass}">${connText} ${data.port ? '('+data.port+')' : ''}</div>
-                <div class="status-item ${logClass}">${logText}</div>
-                <div class="status-item ${serClass}">${serText}</div>
-                <div class="status-item ${csiClass}">${csiText}</div>
-                <div>Packets: ${data.packet_count}</div>
-                <div>Raw: ${data.raw_line_count||0}</div>
-                <div>Last serial: ${serAge}</div>
-                <div>CSI: ${data.csi_packet_count||0}</div>
-                <div>Last CSI: ${csiAge}</div>
-                <div>Session: ${data.session_id||'—'}</div>
-            `;
-
-            // populate TX filter dropdown with newly observed TXs
-            syncTxFilter(data.observed_tx_ids || []);
-
-            // diagnostics panel
-            const diag = data.csi_diag || {};
-            const txStats = data.tx_stats || {};
-            const txCountsHtml = Object.entries(txStats).map(([id, s]) =>
-                `<div class="data-item"><strong>TX${id} frames:</strong> ${s.packet_count} | last RSSI: ${s.last_rssi ?? '—'} dBm</div>`
-            ).join('');
-            const diagCounts = (diag.tx_counts && Object.keys(diag.tx_counts).length)
-                ? Object.entries(diag.tx_counts).map(([id, n]) =>
-                    `<div class="data-item"><strong>FW TX${id} count:</strong> ${n}</div>`).join('')
-                : '';
-
-            document.getElementById('serial-diagnostics').innerHTML = `
-                <div class="data-item"><strong>Raw Lines:</strong> ${data.raw_line_count||0}</div>
-                <div class="data-item"><strong>Serial:</strong> ${serText}</div>
-                <div class="data-item"><strong>CSI Callbacks:</strong> ${diag.callbacks??0}</div>
-                <div class="data-item"><strong>CSI Matches:</strong> ${diag.matches??0}</div>
-                <div class="data-item"><strong>Zero Len:</strong> ${diag.zero_len??0}</div>
-                <div class="data-item"><strong>Queue Drop:</strong> ${diag.queue_drop??0}</div>
-                ${txCountsHtml}
-                ${diagCounts}
-            `;
-        });
-}
-
-// ── latest data per TX ────────────────────────────────────────────────────────
-function fmtTime(s) {
-    if (s == null) return '—';
-    if (s < 60) return `${s.toFixed(1)}s`;
-    if (s < 3600) return `${Math.floor(s/60)}m ${Math.floor(s%60)}s`;
-    return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
-}
-function fmtSC(v) { return v == null ? '—' : Number(v).toFixed(2); }
-
-function updateLatestData() {
-    fetch('/api/latest_by_tx')
-        .then(r => r.json())
-        .then(byTx => {
-            const div = document.getElementById('latest-data');
-            const entries = Object.entries(byTx);
-            if (!entries.length) {
-                div.innerHTML = '<div class="data-item">Waiting for CSI data...</div>';
-                return;
-            }
-            div.innerHTML = entries.sort(([a],[b])=>parseInt(a)-parseInt(b)).map(([txId, d]) => `
-                <div class="tx-card tx-${txId}">
-                    <span class="tx-badge">TX${txId}</span>
-                    group&nbsp;#${d.group_id}&nbsp;&nbsp;pkt&nbsp;#${d.packet_num}
-                    <div class="tx-fields">
-                        <div class="data-item"><strong>RSSI:</strong> ${d.rssi} dBm</div>
-                        <div class="data-item"><strong>Rate:</strong> ${d.rate}</div>
-                        <div class="data-item"><strong>Chan:</strong> ${d.channel} / BW:${d.bandwidth}</div>
-                        <div class="data-item"><strong>Len:</strong> ${d.data_length}</div>
-                        <div class="data-item"><strong>Elapsed:</strong> ${fmtTime(d.time_passed)}</div>
-                        <div class="data-item"><strong>SC1:</strong> ${fmtSC(d.subcarrier_1)}</div>
-                        <div class="data-item"><strong>SC5:</strong> ${fmtSC(d.subcarrier_5)}</div>
-                        <div class="data-item"><strong>SC9:</strong> ${fmtSC(d.subcarrier_9)}</div>
-                        <div class="data-item"><strong>SC13:</strong> ${fmtSC(d.subcarrier_13)}</div>
-                    </div>
-                </div>
-            `).join('');
-        });
-}
-
-// ── data log ──────────────────────────────────────────────────────────────────
-function updateDataLog() {
-    fetch('/api/recent')
-        .then(r => r.json())
-        .then(data => {
-            const div = document.getElementById('data-log');
-            if (!data.length) { div.innerHTML = '<div>Waiting for CSI data...</div>'; return; }
-            div.innerHTML = data.slice(-15).reverse().map(p => {
-                const txId = p.tx_id || 0;
-                const badgeClass = txId ? `log-tx-${txId}` : '';
-                const badge = txId ? `<span class="log-tx-badge ${badgeClass}">TX${txId}</span>` : '';
-                return `<div class="log-entry">${badge}grp&nbsp;${p.group_id}&nbsp;pkt&nbsp;#${p.packet_num}&nbsp;SC1=${fmtSC(p.subcarrier_1)}&nbsp;RSSI=${p.rssi}&nbsp;t=${fmtTime(p.time_passed)}</div>`;
-            }).join('');
-            div.scrollTop = 0;
-        });
-}
-
-// ── control ───────────────────────────────────────────────────────────────────
-function connect() {
-    const port = document.getElementById('port-input').value || 'COM9';
-    fetch('/api/connect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ port }),
-    }).then(r => r.json()).then(() => updateStatus());
-}
-function disconnect()   { fetch('/api/disconnect', { method: 'POST' }); }
-function startLogging() { fetch('/api/start',      { method: 'POST' }); }
-function stopLogging()  { fetch('/api/stop',       { method: 'POST' }); }
-
-// ── polling ───────────────────────────────────────────────────────────────────
-refreshSubcarriers();
-setInterval(() => {
-    updateStatus();
-    updateLatestData();
-    updateDataLog();
-    updateCharts();
-}, 1000);
-updateStatus();
-</script>
-</body>
-</html>
-'''
-
-# ── Flask routes ──────────────────────────────────────────────────────────────
 
 @app.route('/api/status')
 def api_status():
-    if logger:
-        return jsonify(logger.get_status())
-    return jsonify({'connected': False, 'logging': False, 'packet_count': 0,
-                    'port': '', 'session_id': None, 'session_dir': None,
-                    'tx_stats': {}, 'observed_tx_ids': []})
+    return jsonify(monitor.snapshot(10**12, 10**12)['status'])
 
-@app.route('/api/latest')
-def api_latest():
-    if logger:
-        by_tx = logger.get_latest_by_tx()
-        return jsonify(next(iter(by_tx.values()), {}))
-    return jsonify({})
 
-@app.route('/api/latest_by_tx')
-def api_latest_by_tx():
-    if logger:
-        return jsonify(logger.get_latest_by_tx())
-    return jsonify({})
+@app.route('/api/ports')
+def api_ports():
+    return jsonify(list_ports())
 
-@app.route('/api/recent')
-def api_recent():
-    if logger:
-        return jsonify(logger.get_recent_data())
-    return jsonify([])
 
-@app.route('/api/subcarriers')
-def api_subcarriers():
-    if logger:
-        return jsonify(logger.get_available_subcarriers())
-    return jsonify([])
+@app.route('/api/probe', methods=['POST'])
+def api_probe():
+    return jsonify({'results': probe_ports()})
 
-@app.route('/api/plot_data')
-def api_plot_data():
-    if logger:
-        sub_str = request.args.get('subcarriers', '')
-        tx_str  = request.args.get('tx', '').strip()
-        selected = [int(x) for x in sub_str.split(',') if x.strip().isdigit()]
-        tx_filter = int(tx_str) if tx_str.isdigit() else None
-        return jsonify(logger.get_plot_data(
-            selected_subcarriers=selected or None,
-            tx_filter=tx_filter,
-        ))
-    return jsonify({'rssi_by_tx': {}, 'subcarriers': {}})
-
-@app.route('/api/raw')
-def api_raw():
-    if logger:
-        return jsonify(logger.get_raw_lines())
-    return jsonify([])
 
 @app.route('/api/connect', methods=['POST'])
 def api_connect():
-    global logger
-    data = request.get_json()
-    port = data.get('port', 'COM9')
-    print(f"\n{'='*60}\n[API] connect port={port}\n{'='*60}\n")
-    if logger:
-        cleanup_logger()
-        time.sleep(1)
-    logger = ESPNOWDataLogger(port)
-    success = logger.connect()
-    started = False
-    if success:
-        try:
-            started = logger.start_logging()
-        except Exception as e:
-            print(f"[API] start_logging error: {e}")
-    return jsonify({'success': success, 'port': port, 'logging': started})
+    data = request.get_json(silent=True) or {}
+    port = (data.get('port') or '').strip()
+    if not port:
+        return jsonify({'ok': False, 'error': 'No serial port selected.'})
+    try:
+        baud = int(data.get('baud') or DEFAULT_BAUD)
+    except (TypeError, ValueError):
+        baud = DEFAULT_BAUD
+    ok, err = monitor.connect(port, baud, reset=bool(data.get('reset')))
+    if ok and data.get('record'):
+        monitor.start_recording()
+    return jsonify({'ok': ok, 'error': err})
+
 
 @app.route('/api/disconnect', methods=['POST'])
 def api_disconnect():
-    global logger
-    cleanup_logger()
-    return jsonify({'success': True})
+    monitor.disconnect()
+    return jsonify({'ok': True})
 
-@app.route('/api/shutdown', methods=['POST'])
-def api_shutdown():
-    cleanup_logger()
-    shutdown_func = request.environ.get('werkzeug.server.shutdown')
-    if shutdown_func is None:
-        return jsonify({'success': False, 'error': 'Server shutdown not available'})
-    shutdown_func()
-    return jsonify({'success': True})
 
-@app.route('/api/start', methods=['POST'])
-def api_start():
-    if logger:
-        return jsonify({'success': logger.start_logging()})
-    return jsonify({'success': False, 'error': 'Not connected'})
+@app.route('/api/record/start', methods=['POST'])
+def api_record_start():
+    ok, err = monitor.start_recording()
+    return jsonify({'ok': ok, 'error': err})
 
-@app.route('/api/stop', methods=['POST'])
-def api_stop():
-    if logger:
-        logger.stop_logging()
-        return jsonify({'success': True})
-    return jsonify({'success': False})
+
+@app.route('/api/record/stop', methods=['POST'])
+def api_record_stop():
+    info = monitor.stop_recording()
+    return jsonify({'ok': True, 'saved': info})
+
+
+@app.route('/api/recordings')
+def api_recordings():
+    return jsonify(list_recordings())
+
+
+@app.route('/recordings/<path:rel>')
+def download_recording(rel):
+    return send_from_directory(SESSIONS_DIR, rel, as_attachment=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description='ESP32 CSI live web dashboard')
+    ap.add_argument('--host', default='0.0.0.0', help='HTTP bind address (default 0.0.0.0)')
+    ap.add_argument('--port', type=int, default=5000, help='HTTP port (default 5000)')
+    ap.add_argument('--serial', help='serial port to connect on start, e.g. COM11')
+    ap.add_argument('--baud', type=int, default=DEFAULT_BAUD, help=f'baud rate (default {DEFAULT_BAUD})')
+    ap.add_argument('--record', action='store_true', help='start recording right away (needs --serial)')
+    args = ap.parse_args()
+
+    if args.serial:
+        ok, err = monitor.connect(args.serial, args.baud)
+        if not ok:
+            print(f"[web_app] {err}")
+        elif args.record:
+            monitor.start_recording()
+
+    print(f"\n  ESP32 CSI dashboard running ->  http://localhost:{args.port}\n"
+          f"  (Ctrl+C to stop)\n")
+    try:
+        app.run(host=args.host, port=args.port, debug=False, threaded=True, use_reloader=False)
+    finally:
+        monitor.disconnect()
+
 
 if __name__ == '__main__':
-    try:
-        app.run(debug=True, use_reloader=False, host='0.0.0.0', port=5000)
-    finally:
-        cleanup_logger()
+    main()

@@ -122,11 +122,29 @@ class CsiLogViewer:
                              padx=10, pady=4, cursor="hand2")
 
         # ── serial section ──
+        default_port = "COM11"
+        try:
+            cfg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+            if os.path.exists(cfg_file):
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    devs = json.load(f).get("devices", {})
+                    for d in devs.values():
+                        if d.get("role") == "RECEIVER" and d.get("port"):
+                            default_port = d["port"]
+                            break
+        except Exception:
+            pass
         lbl("Port:").pack(side=tk.LEFT)
-        self.port_var = tk.StringVar(value="COM9")
+        self.port_var = tk.StringVar(value=default_port)
         tk.Entry(bar, textvariable=self.port_var, width=8,
                  bg="#3c3c3c", fg="#d4d4d4", insertbackground="white",
-                 relief=tk.FLAT, font=("Consolas", 9)).pack(side=tk.LEFT, padx=(3, 4))
+                 relief=tk.FLAT, font=("Consolas", 9)).pack(side=tk.LEFT, padx=(3, 6))
+
+        lbl("Baud:").pack(side=tk.LEFT)
+        self.baud_var = tk.StringVar(value="115200")
+        ttk.Combobox(bar, textvariable=self.baud_var,
+                     values=["115200", "921600", "2000000"], state="readonly",
+                     width=8, font=("Consolas", 9)).pack(side=tk.LEFT, padx=(3, 4))
 
         self.btn_connect = btn("⏺  Record", self._toggle_serial, "#c0392b")
         self.btn_connect.pack(side=tk.LEFT, padx=3)
@@ -232,16 +250,23 @@ class CsiLogViewer:
             return
         port = self.port_var.get().strip()
         try:
-            self.serial_conn = serial.Serial(port, 2000000, timeout=1, dsrdtr=False, rtscts=False)
-            # Standard ESP32 reset sequence to boot into the application normally
+            baud = int(self.baud_var.get().strip())
+        except Exception:
+            baud = 115200
+        try:
+            self.serial_conn = serial.Serial()
+            self.serial_conn.port = port
+            self.serial_conn.baudrate = baud
+            self.serial_conn.timeout = 0.2
             self.serial_conn.dtr = False
-            self.serial_conn.rts = True
-            time.sleep(0.1)
             self.serial_conn.rts = False
+            self.serial_conn.open()
             time.sleep(0.05)
-            self.serial_conn.dtr = False
-            # Wait for boot phase to complete
-            time.sleep(1.5)
+            if self.serial_conn.in_waiting > 0:
+                try:
+                    self.serial_conn.read(self.serial_conn.in_waiting)
+                except Exception:
+                    pass
         except Exception as e:
             self.status_var.set(f"Serial error: {e}")
             return
@@ -326,17 +351,27 @@ class CsiLogViewer:
 
     def _serial_loop(self):
         """Runs in background thread: reads serial, parses CSI, writes CSV."""
+        rx_buf = ""
         while self.serial_running:
             try:
-                if self.serial_conn and self.serial_conn.in_waiting > 0:
-                    raw = self.serial_conn.readline()
-                    line = raw.decode('utf-8', errors='ignore').strip()
-                    if line:
-                        self._handle_line(line)
+                waiting = self.serial_conn.in_waiting if self.serial_conn else 0
+                if waiting > 0:
+                    chunk = self.serial_conn.read(min(waiting, 8192)).decode('utf-8', errors='ignore').replace('\x00', '')
+                    rx_buf += chunk
+                    if "\n" in rx_buf:
+                        lines = rx_buf.splitlines()
+                        if not rx_buf.endswith(("\n", "\r")):
+                            rx_buf = lines.pop() if lines else ""
+                        else:
+                            rx_buf = ""
+                        for line in lines:
+                            line = line.strip()
+                            if line:
+                                self._handle_line(line)
                 else:
                     time.sleep(0.005)
             except Exception:
-                pass
+                time.sleep(0.01)
 
     def _handle_line(self, line: str):
         m = CSI_REGEX.search(line)

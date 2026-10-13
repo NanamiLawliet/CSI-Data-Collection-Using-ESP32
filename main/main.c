@@ -19,7 +19,11 @@
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
 #include "driver/uart.h"
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+#include "driver/uart_vfs.h"
+#else
 #include "esp_vfs_dev.h"
+#endif
 #include "esp_timer.h"
 
 #define ESPNOW_CHANNEL        1
@@ -73,6 +77,8 @@ typedef struct {
 static transmitter_map_t s_known_transmitters[MAX_KNOWN_TRANSMITTERS] = {0};
 static int s_known_transmitters_count = 0;
 
+static esp_err_t configure_espnow_peer_rate(const uint8_t *peer_mac);
+
 static void update_transmitter_map(const uint8_t *mac, uint8_t tx_id)
 {
     // Search if already exists
@@ -89,6 +95,16 @@ static void update_transmitter_map(const uint8_t *mac, uint8_t tx_id)
         s_known_transmitters[s_known_transmitters_count].tx_id = tx_id;
         s_known_transmitters[s_known_transmitters_count].last_seen_ms = esp_log_timestamp();
         s_known_transmitters_count++;
+        if (!esp_now_is_peer_exist(mac)) {
+            esp_now_peer_info_t peer = {0};
+            memcpy(peer.peer_addr, mac, ESP_NOW_ETH_ALEN);
+            peer.channel = ESPNOW_CHANNEL;
+            peer.ifidx   = ESP_IF_WIFI_STA;
+            peer.encrypt = false;
+            if (esp_now_add_peer(&peer) == ESP_OK) {
+                configure_espnow_peer_rate(mac);
+            }
+        }
         ESP_LOGI(TAG, "Dynamic Transmitter Registered: MAC %02x:%02x:%02x:%02x:%02x:%02x -> tx_id %d",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], tx_id);
     }
@@ -213,12 +229,11 @@ static esp_err_t init_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(ESPNOW_TX_POWER_DBM));
-
-    // Force default channel setting (succeeds immediately in standalone STA mode)
     ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(ESPNOW_TX_POWER_DBM));
 
     return ESP_OK;
 }
@@ -376,6 +391,7 @@ static void espnow_recv_cb(const uint8_t *mac_addr, const uint8_t *data, int len
     // Dynamically register or update transmitter mapping based on incoming ESP-NOW message
     update_transmitter_map(src_mac, payload->tx_id);
 
+    // Log incoming ESP-NOW packet with sequence number for accurate loss tracking
     ESP_LOGI("ESP_NOW_RX", "Gelen paket: seq=%" PRIu32 " tx_id=%u rssi=%d",
              payload->seq,
              payload->tx_id,
@@ -496,6 +512,7 @@ static esp_err_t init_csi(void)
     };
 
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_cfg));
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_cb, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_csi(true));
@@ -532,7 +549,7 @@ void app_main(void)
 {
     // Configure UART0
     uart_config_t uart_config = {
-        .baud_rate = 2000000,
+        .baud_rate = 115200,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
@@ -541,7 +558,7 @@ void app_main(void)
     };
     
     // Install UART driver on UART_NUM_0 at the absolute start of boot
-    uart_driver_install(UART_NUM_0, 256 * 2, 0, 0, NULL, 0);
+    uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0);
     uart_param_config(UART_NUM_0, &uart_config);
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
     uart_vfs_dev_use_driver(0);
@@ -584,7 +601,8 @@ void app_main(void)
     } 
     else if (s_current_role == 2) { // RECEIVER
         ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, local_mac));
-        csi_queue = xQueueCreate(64, sizeof(csi_event_t));
+        // Queue size 2 ensures data is ALWAYS real-time (max ~100ms queue latency)
+        csi_queue = xQueueCreate(2, sizeof(csi_event_t));
         if (csi_queue == NULL) {
             ESP_LOGE(TAG, "Failed to create CSI queue");
             return;

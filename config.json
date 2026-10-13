@@ -7,13 +7,13 @@
             "tx_id": 1
         },
         "68:FE:71:0C:91:3C": {
-            "port": "COM4",
+            "port": "COM9",
             "role": "TRANSMITTER",
             "peer_mac": "88:57:21:C0:81:B4",
             "tx_id": 1
         },
         "88:57:21:C0:81:B4": {
-            "port": "COM9",
+            "port": "COM11",
             "role": "RECEIVER",
             "peer_mac": "00:00:00:00:00:00",
             "tx_id": 1
