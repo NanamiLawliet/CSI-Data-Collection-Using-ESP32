@@ -827,6 +827,8 @@
                         </select>
                     </div>
 
+                    <button id="btn-smooth" class="btn btn-ghost btn-xs" onclick="toggleSmooth()" title="Sinyal yumuşatma filtresi (EMA)"><span id="smooth-icon">〰</span> <span id="smooth-text">Filtre: Kapalı</span></button>
+                    <button id="btn-scale" class="btn btn-ghost btn-xs" onclick="toggleScale()" title="Y-ekseni ölçek modu: Otomatik Zoom / Sabit Aralık"><span id="scale-icon">📐</span> <span id="scale-text">Ölçek: Otomatik</span></button>
                     <button id="btn-pause" class="btn btn-ghost btn-xs" onclick="togglePause()">⏸ Pause</button>
                     <button class="btn btn-ghost btn-xs" onclick="clearData()">Clear</button>
                     <button id="btn-fullscreen" class="btn btn-ghost btn-xs" onclick="toggleFullscreen()" title="Tam Ekran (Kısayol: F / Esc)"><span id="fs-icon">⛶</span> <span id="fs-text">Tam Ekran</span></button>
@@ -1088,6 +1090,7 @@
                 chartInstance.options.scales.y.title.text = 'Subcarrier Amplitude';
             }
 
+            updateYScale();
             renderCharts(true);
         }
 
@@ -1113,6 +1116,78 @@
         function clearData() {
             frameHistory = [];
             latestFrameByTx = {};
+            renderCharts(true);
+        }
+
+        let isSmoothEnabled = false;
+        let isFixedScaleEnabled = false;
+
+        function applyEMA(points, alpha = 0.2) {
+            if (!points || points.length === 0) return [];
+            const result = [];
+            let val = points[0].y;
+            for (let i = 0; i < points.length; i++) {
+                val = alpha * points[i].y + (1 - alpha) * val;
+                result.push({ x: points[i].x, y: Math.round(val * 10) / 10 });
+            }
+            return result;
+        }
+
+        function toggleSmooth() {
+            isSmoothEnabled = !isSmoothEnabled;
+            const btn = document.getElementById('btn-smooth');
+            const txt = document.getElementById('smooth-text');
+            if (isSmoothEnabled) {
+                if (btn) {
+                    btn.classList.add('btn-primary');
+                    btn.classList.remove('btn-ghost');
+                }
+                if (txt) txt.textContent = 'Filtre: Açık';
+            } else {
+                if (btn) {
+                    btn.classList.remove('btn-primary');
+                    btn.classList.add('btn-ghost');
+                }
+                if (txt) txt.textContent = 'Filtre: Kapalı';
+            }
+            renderCharts(true);
+        }
+
+        function updateYScale() {
+            if (!chartInstance) return;
+            const txt = document.getElementById('scale-text');
+            if (!isFixedScaleEnabled) {
+                delete chartInstance.options.scales.y.min;
+                delete chartInstance.options.scales.y.max;
+                if (txt) txt.textContent = 'Ölçek: Otomatik';
+            } else {
+                if (currentChartTab === 'rssi') {
+                    chartInstance.options.scales.y.min = -90;
+                    chartInstance.options.scales.y.max = 0;
+                    if (txt) txt.textContent = 'Ölçek: Sabit (-90-0)';
+                } else {
+                    chartInstance.options.scales.y.min = 0;
+                    chartInstance.options.scales.y.max = 70;
+                    if (txt) txt.textContent = 'Ölçek: Sabit (0-70)';
+                }
+            }
+        }
+
+        function toggleScale() {
+            isFixedScaleEnabled = !isFixedScaleEnabled;
+            const btn = document.getElementById('btn-scale');
+            if (isFixedScaleEnabled) {
+                if (btn) {
+                    btn.classList.add('btn-primary');
+                    btn.classList.remove('btn-ghost');
+                }
+            } else {
+                if (btn) {
+                    btn.classList.remove('btn-primary');
+                    btn.classList.add('btn-ghost');
+                }
+            }
+            updateYScale();
             renderCharts(true);
         }
 
@@ -1209,10 +1284,22 @@
                     const frame = latestFrameByTx[txId];
                     if (!frame || !frame.amp) return;
 
+                    let rawAmps = frame.amp.slice(0, 64);
+                    if (isSmoothEnabled) {
+                        const smoothedAmps = [];
+                        for (let k = 0; k < rawAmps.length; k++) {
+                            const prev = k > 0 ? rawAmps[k - 1] : rawAmps[k];
+                            const curr = rawAmps[k];
+                            const next = k < rawAmps.length - 1 ? rawAmps[k + 1] : rawAmps[k];
+                            smoothedAmps.push(Math.round((prev * 0.25 + curr * 0.5 + next * 0.25) * 10) / 10);
+                        }
+                        rawAmps = smoothedAmps;
+                    }
+
                     const color = getTxColor(txId);
                     datasets.push({
                         label: `TX${txId} Spectrum`,
-                        data: frame.amp.slice(0, 64).map((val, idx) => ({ x: idx, y: val })),
+                        data: rawAmps.map((val, idx) => ({ x: idx, y: val })),
                         backgroundColor: color + '99',
                         borderColor: color,
                         borderWidth: 1,
@@ -1237,14 +1324,15 @@
 
                 const datasets = Object.keys(txDataMap).map(txId => {
                     const color = getTxColor(txId);
+                    const pts = isSmoothEnabled ? applyEMA(txDataMap[txId], 0.2) : txDataMap[txId];
                     return {
                         label: `TX${txId} RSSI`,
-                        data: txDataMap[txId],
+                        data: pts,
                         borderColor: color,
                         backgroundColor: color + '22',
                         borderWidth: 2,
                         pointRadius: 0,
-                        tension: 0.1
+                        tension: isSmoothEnabled ? 0.35 : 0.1
                     };
                 });
 
@@ -1268,14 +1356,16 @@
                     }
                 });
 
+                const scPts = isSmoothEnabled ? applyEMA(points, 0.25) : points;
+
                 scDatasets.push({
                     label: `SC ${scIdx}`,
-                    data: points,
+                    data: scPts,
                     borderColor: color,
                     backgroundColor: color + '11',
                     borderWidth: 1.8,
                     pointRadius: 0,
-                    tension: 0.1
+                    tension: isSmoothEnabled ? 0.35 : 0.1
                 });
             });
 
