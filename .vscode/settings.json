@@ -2,7 +2,7 @@
   "C_Cpp.intelliSenseEngine": "default",
   "C_Cpp.default.compilerPath": "C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin/xtensa-esp32-elf-gcc.exe",
   "C_Cpp.default.compileCommands": "C:/Users/burak/Desktop/apps/projects/CSI-Data-Collection-Using-ESP32/build/compile_commands.json",
-  "idf.currentSetup": "C:\\Espressif\\frameworks\\esp-idf-v5.5.5-2",
+  "idf.currentSetup": "C:\\Espressif\\v5.5.5\\esp-idf",
   "idf.flashType": "UART",
   "idf.portWin": "COM9"
 }

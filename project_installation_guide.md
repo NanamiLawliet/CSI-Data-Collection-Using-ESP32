@@ -64,16 +64,35 @@ winget install --id Python.Python.3.12 -e --source winget --accept-package-agree
 ```
 > **Note:** After installation, restart your terminal (or refresh `PATH`) and verify that `python --version` and `py --version` return `Python 3.12.x`.
 
-#### 2.2. Install Git
+#### 2.2. Install and Configure Git
 To install the standard Git for Windows package (will prompt for Administrator permission):
 ```powershell
 winget install --id Git.Git -e --source winget --accept-package-agreements --accept-source-agreements
 ```
 *(Alternatively, if installing without Administrator privileges, download `MinGit` or `PortableGit` from GitHub, extract it to `%LOCALAPPDATA%\Programs\Git`, and add `%LOCALAPPDATA%\Programs\Git\cmd` to your User `Path` environment variable.)*
 
-#### 2.3. Install Espressif Installation Manager CLI (`eim`)
+After installing Git, configure your global Git username and email address:
+```powershell
+git config --global user.name "NanamiLawliet"
+git config --global user.email "burakmentesss@gmail.com"
+```
+
+#### 2.3. Install Espressif Installation Manager CLI (`eim`) & USB-UART Drivers
 ```powershell
 winget install --id Espressif.EIM-CLI -e --source winget --accept-package-agreements --accept-source-agreements
+```
+
+To install the Silicon Labs **CP210x** (`CP2102 USB to UART Bridge Controller`) and **CH340/CH341** USB-to-UART drivers on a fresh Windows system, open **PowerShell as Administrator** and run:
+```powershell
+eim install-drivers
+```
+*(Or download and install the driver packages directly via `pnputil` in an Administrator PowerShell):*
+```powershell
+$driverDir = "C:\Users\$env:USERNAME\Desktop\apps\drivers"
+New-Item -ItemType Directory -Force -Path "$driverDir\CP210x" | Out-Null
+curl.exe -4 -L -o "$driverDir\CP210x.zip" "https://dl.espressif.com/dl/idf-installer/CP210x_Universal_Windows_Driver.zip"
+Expand-Archive -Path "$driverDir\CP210x.zip" -DestinationPath "$driverDir\CP210x" -Force
+pnputil /add-driver "$driverDir\CP210x\silabser.inf" /install
 ```
 
 #### 2.4. Refresh Environment Variables in the Current PowerShell Session

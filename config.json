@@ -13,7 +13,7 @@
             "tx_id": 1
         },
         "88:57:21:C0:81:B4": {
-            "port": "COM11",
+            "port": "COM10",
             "role": "RECEIVER",
             "peer_mac": "00:00:00:00:00:00",
             "tx_id": 1
