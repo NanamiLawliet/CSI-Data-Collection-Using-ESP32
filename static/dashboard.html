@@ -827,11 +827,11 @@
                         </select>
                     </div>
 
-                    <button id="btn-smooth" class="btn btn-ghost btn-xs" onclick="toggleSmooth()" title="Sinyal yumuşatma filtresi (EMA)"><span id="smooth-icon">〰</span> <span id="smooth-text">Filtre: Kapalı</span></button>
-                    <button id="btn-scale" class="btn btn-ghost btn-xs" onclick="toggleScale()" title="Y-ekseni ölçek modu: Otomatik Zoom / Sabit Aralık"><span id="scale-icon">📐</span> <span id="scale-text">Ölçek: Otomatik</span></button>
+                    <button id="btn-smooth" class="btn btn-ghost btn-xs" onclick="toggleSmooth()" title="Signal smoothing filter (EMA)"><span id="smooth-icon">〰</span> <span id="smooth-text">Filter: Off</span></button>
+                    <button id="btn-scale" class="btn btn-ghost btn-xs" onclick="toggleScale()" title="Y-axis scale mode: Auto Zoom / Fixed Range"><span id="scale-icon">📐</span> <span id="scale-text">Scale: Auto</span></button>
                     <button id="btn-pause" class="btn btn-ghost btn-xs" onclick="togglePause()">⏸ Pause</button>
                     <button class="btn btn-ghost btn-xs" onclick="clearData()">Clear</button>
-                    <button id="btn-fullscreen" class="btn btn-ghost btn-xs" onclick="toggleFullscreen()" title="Tam Ekran (Kısayol: F / Esc)"><span id="fs-icon">⛶</span> <span id="fs-text">Tam Ekran</span></button>
+                    <button id="btn-fullscreen" class="btn btn-ghost btn-xs" onclick="toggleFullscreen()" title="Fullscreen (Shortcut: F / Esc)"><span id="fs-icon">⛶</span> <span id="fs-text">Fullscreen</span></button>
                 </div>
             </div>
 
@@ -1142,13 +1142,13 @@
                     btn.classList.add('btn-primary');
                     btn.classList.remove('btn-ghost');
                 }
-                if (txt) txt.textContent = 'Filtre: Açık';
+                if (txt) txt.textContent = 'Filter: On';
             } else {
                 if (btn) {
                     btn.classList.remove('btn-primary');
                     btn.classList.add('btn-ghost');
                 }
-                if (txt) txt.textContent = 'Filtre: Kapalı';
+                if (txt) txt.textContent = 'Filter: Off';
             }
             renderCharts(true);
         }
@@ -1159,16 +1159,16 @@
             if (!isFixedScaleEnabled) {
                 delete chartInstance.options.scales.y.min;
                 delete chartInstance.options.scales.y.max;
-                if (txt) txt.textContent = 'Ölçek: Otomatik';
+                if (txt) txt.textContent = 'Scale: Auto';
             } else {
                 if (currentChartTab === 'rssi') {
                     chartInstance.options.scales.y.min = -60;
                     chartInstance.options.scales.y.max = 10;
-                    if (txt) txt.textContent = 'Ölçek: Sabit (-60..+10)';
+                    if (txt) txt.textContent = 'Scale: Fixed (-60..+10)';
                 } else {
                     chartInstance.options.scales.y.min = 0;
                     chartInstance.options.scales.y.max = 70;
-                    if (txt) txt.textContent = 'Ölçek: Sabit (0-70)';
+                    if (txt) txt.textContent = 'Scale: Fixed (0-70)';
                 }
             }
         }
@@ -1205,7 +1205,7 @@
                     btn.classList.remove('btn-ghost');
                 }
                 if (icon) icon.textContent = '✕';
-                if (txt) txt.textContent = 'Küçült (Esc)';
+                if (txt) txt.textContent = 'Exit (Esc)';
                 if (document.documentElement.requestFullscreen && !document.fullscreenElement) {
                     document.documentElement.requestFullscreen().catch(() => {});
                 }
@@ -1215,7 +1215,7 @@
                     btn.classList.add('btn-ghost');
                 }
                 if (icon) icon.textContent = '⛶';
-                if (txt) txt.textContent = 'Tam Ekran';
+                if (txt) txt.textContent = 'Fullscreen';
                 if (document.fullscreenElement && document.exitFullscreen) {
                     document.exitFullscreen().catch(() => {});
                 }
@@ -1257,7 +1257,7 @@
                     btn.classList.add('btn-ghost');
                 }
                 if (icon) icon.textContent = '⛶';
-                if (txt) txt.textContent = 'Tam Ekran';
+                if (txt) txt.textContent = 'Fullscreen';
                 setTimeout(() => {
                     if (chartInstance) {
                         chartInstance.resize();

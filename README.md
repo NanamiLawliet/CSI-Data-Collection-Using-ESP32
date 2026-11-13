@@ -1,99 +1,115 @@
-# CSI Data Collection Using ESP32
+# ESP32 Wi-Fi CSI Data Collection & Real-Time Visualization System
 
-**Course:** ELE529E Embedded Systems  
-**Objective:** Real-time CSI data collection and visualization using ESP32 and FreeRTOS
-
-## Features
-- Real-time CSI data collection using ESP32
-- FreeRTOS-based task management
-- Web-based real-time visualization
-- Configurable subcarrier selection
-- Data logging and export functionality
-
-## Project Structure
-```
-├── main/
-│   ├── main.c              # ESP32 firmware with FreeRTOS implementation
-│   └── CMakeLists.txt
-├── web_app.py             # Python web application for visualization
-├── CMakeLists.txt
-└── README.md
-```
-
-## Hardware Requirements
-- ESP32 Development Board
-- USB-to-Serial Cable
-- Computer for running web visualization
-- Wi-Fi Access Point
-
-## Software Requirements
-- ESP-IDF v5.4
-- Python 3.x with Flask
-- Web Browser (Chrome recommended)
-
-## Setup Instructions
-
-### ESP32 Setup
-1. Install ESP-IDF v5.4
-2. Clone this repository
-3. Configure your WiFi credentials in `sdkconfig`
-```bash
-# ESP32 CSI Collection Tool Config
-CONFIG_SSID="myssid"
-CONFIG_PASSWORD="mypassword"
-# end of ESP32 CSI Collection Tool Config
-```
-5. Build and flash the firmware:
-```bash
-idf.py build
-idf.py -p (PORT) flash
-```
-or in VS Code, Command+Shift+P > Select 'ESP-IDF: Build Project' > Flash
-! DO NOT monitor as doing so will block web application's access to serial port
-
-### Web Application Setup
-1. Install Python dependencies:
-```bash
-pip install flask pyserial
-```
-2. Run the web application:
-```bash
-python web_app.py
-```
-3. Open your browser and navigate to `http://localhost:5000`
-
-![image](https://github.com/user-attachments/assets/99b9bce7-e8c1-41d6-bc94-7a494d9b1ea7)
-
-
-## FreeRTOS Implementation
-The project uses FreeRTOS for efficient task management:
-- WiFi Initialization Task (Priority: 5)
-- CSI Processing Task (Priority: 3)
-- Inter-task communication using queues
-- Task synchronization using semaphores
-
-## Usage
-1. Connect to ESP32 through the web interface
-2. Start CSI data collection
-3. Select subcarriers to plot
-4. Observe real-time CSI data visualization
-5. Export data for analysis
-
-## Troubleshooting
-- If seeing squiggly lines, clean the build, then build again till succeeds. This usually solves ESP-IDF library problems.
-- If there are include errors related to cmake, disable the "cmake tools" extension on VS Code.
-- If encounter any other problem: Delete the build folder completely, then rebuild
-- Make sure ESP32 is connected to an access point. The ESP32 does not work in monitor mode in this project, it needs to be connected.
-
-## Useful Resources
-- [ESP-IDF Documentation](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/)
-- [ESP32 CSI Documentation](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/wifi.html#wi-fi-channel-state-information)
-- [FreeRTOS Documentation](https://www.freertos.org/Documentation/RTOS_book.html)
-- [How to create your First ESP IDF project](https://www.youtube.com/watch?v=oHHOCdmLiII)  
-- https://github.com/espressif/esp-csi  
-- [Getting Started with ESP32 Wireless Networking in C](https://www.youtube.com/watch?v=_dRrarmQiAM)
-
-## Contributing
-Feel free to submit issues and enhancement requests!
+A complete, connectionless **Wi-Fi Channel State Information (CSI)** data collection, multi-node orchestration, and real-time visualization platform built on **ESP32**, **ESP-IDF v5.5.5 (FreeRTOS & ESP-NOW)**, and **Python**.
 
 ---
+
+## Key Features
+
+- **Single Unified Firmware Image:** One firmware binary (`main/main.c`) flashes onto every ESP32 board. Each board can be dynamically configured at runtime over USB Serial (`2,000,000 baud`) as an `IDLE` node, `TRANSMITTER` (`TX`), or `RECEIVER` (`RX`) with persistent NVS storage.
+- **Connectionless ESP-NOW CSI Acquisition:** Operates directly at the 802.11 MAC layer without requiring a router or Wi-Fi Access Point. Supports high-frequency packet transmission (up to `1000 Hz`) and multi-transmitter time-division multiplexing (TDM).
+- **One-Click Windows Setup Wizard (`Easy_Setup_Wizard.bat`):** Self-contained Windows GUI installer that automatically installs Python 3.12, Git, Espressif Installation Manager (`eim`), Silicon Labs CP210x USB-UART drivers, ESP-IDF v5.5.5, Python packages, builds & verifies the firmware (`build/project-name.bin`), and optionally flashes connected ESP32 boards.
+- **Central Control GUI (`central_control.py`):** Auto-discovers all connected ESP32 boards over USB, assigns `TRANSMITTER`/`RECEIVER` roles, configures Wi-Fi channel (`1–13`), bandwidth (`20/40 MHz`), transmit rate (`10–1000 Hz`), TX power (`2–20 dBm`), and launches the Web Dashboard in one click.
+- **Real-Time Web Dashboard (`web_app.py` + `static/dashboard.html`):** Browser-based live visualization of RSSI, per-subcarrier amplitude (`64 subcarriers`), EMA signal smoothing, fixed/auto Y-axis scaling, fullscreen mode, and automatic CSV session recording.
+- **Offline CSI Log Viewer (`csi_log_viewer.py`):** Desktop analyzer for inspecting recorded `.csv` CSI sessions with amplitude/phase heatmaps and subcarrier time-series plots.
+
+---
+
+## Repository Structure
+
+```text
+CSI-Data-Collection-Using-ESP32/
+├── main/
+│   ├── main.c                        # Unified ESP32 FreeRTOS + ESP-NOW CSI firmware
+│   ├── CMakeLists.txt                # Firmware component registration
+│   └── Kconfig.projbuild             # ESP-IDF menuconfig definitions
+├── static/
+│   └── dashboard.html                # Real-time Web Dashboard frontend
+├── CMakeLists.txt                    # Root ESP-IDF CMake project file
+├── sdkconfig.defaults                # Default SDK config (enables CONFIG_ESP_WIFI_CSI_ENABLED=y)
+├── Easy_Setup_Wizard.bat             # One-click Windows GUI setup & build wizard
+├── central_control.py                # Multi-node ESP32 role & traffic controller GUI
+├── web_app.py                        # Flask server & high-speed serial CSI parser
+├── csi_log_viewer.py                 # Offline CSV session analyzer & plotter
+├── config.json                       # Node configuration template
+├── project_installation_guide.md     # Detailed manual installation & troubleshooting guide
+└── README.md                         # Project overview and quick-start guide
+```
+
+> **Note on `build/`, `sdkconfig`, `.venv/`, and `sessions/`:**  
+> Machine-specific build artifacts (`build/`, `sdkconfig`), Python virtual environments (`.venv/`), and recorded datasets (`sessions/`) are intentionally excluded via `.gitignore`. Each machine generates its own `sdkconfig` (from `sdkconfig.defaults`) and `build/` directory during compilation.
+
+---
+
+## Hardware Requirements
+
+- **2× (or more) ESP32 Development Boards** (e.g., ESP32-WROOM-32D / ESP32-DevKitC with Silicon Labs CP210x USB-to-UART bridge)
+- **Micro-USB / USB-C Data Cables** (must support data transfer, not charge-only)
+- **Windows 10 / 11 PC**
+
+---
+
+## Quick Start (Recommended: Automated Setup Wizard)
+
+On any Windows 10/11 PC (including a freshly formatted machine):
+
+1. Download or clone this repository (or simply download **`Easy_Setup_Wizard.bat`**).
+2. Double-click **`Easy_Setup_Wizard.bat`**.
+3. Choose your target installation folder using the **Browse...** button and click **Next >**.
+4. The wizard will automatically check and install all prerequisites (Python 3.12, Git, CP210x USB drivers, ESP-IDF v5.5.5, Python libraries), compile the firmware (`idf.py build`), and verify `build/project-name.bin`.
+5. Plug in your ESP32 boards via USB when prompted to erase and flash the firmware (a confirmation dialog with a warning sign is displayed before flashing).
+6. Click **Finish** to launch **Central Control (`central_control.py`)**.
+
+---
+
+## Manual Setup & Usage
+
+For step-by-step manual installation commands and troubleshooting, see **[project_installation_guide.md](project_installation_guide.md)**.
+
+### 1. Build & Flash Firmware (ESP-IDF v5.5.5)
+
+```powershell
+# Activate ESP-IDF v5.5.5 environment
+. "C:\Espressif\tools\Microsoft.v5.5.5.PowerShell_profile.ps1"
+
+# Build the firmware (generates sdkconfig from sdkconfig.defaults and compiles binaries)
+idf.py set-target esp32
+idf.py build
+
+# Erase flash (clears stale NVS RF calibration) and flash each ESP32 board
+idf.py -p COM9 erase-flash flash
+idf.py -p COM11 erase-flash flash
+```
+
+### 2. Install Python Dependencies
+
+```powershell
+python -m pip install --upgrade pip flask pyserial numpy matplotlib
+```
+
+### 3. Configure ESP32 Roles & Start Collecting CSI Data
+
+1. **Assign Node Roles (Central Control):**
+   ```powershell
+   python central_control.py
+   ```
+   - Click **Scan & Discover** to detect your ESP32 boards.
+   - Set one board to **`RECEIVER`** and the other board(s) to **`TRANSMITTER`**.
+   - Click **Apply Configuration (Save to NVS)**.
+2. **Launch Real-Time Web Dashboard:**
+   - Click **Open Web Dashboard** directly inside Central Control (this automatically releases the Receiver COM port and opens `http://localhost:5000`), **or** close Central Control and run:
+     ```powershell
+     python web_app.py --port COM11
+     ```
+3. **Offline Session Analysis:**
+   ```powershell
+   python csi_log_viewer.py
+   ```
+
+---
+
+## Troubleshooting
+
+- **COM Port Busy / Access Denied:** Only one application can hold a serial port open at a time. Close `idf.py monitor` or use the **Open Web Dashboard** button in `central_control.py` so the Receiver port is released before `web_app.py` connects.
+- **No CSI Packets (`callbacks=0` / `ESP-NOW status = FAIL`):** Stale RF calibration data in the ESP32 NVS partition can prevent 2.4 GHz transmission after SDK upgrades. Run `idf.py -p COMx erase-flash flash` on both boards and re-apply roles in `central_control.py`.
+- **`AttributeError: module 'serial' has no attribute 'Serial'`:** Run `python -m pip uninstall -y serial` followed by `python -m pip install --force-reinstall pyserial`.

@@ -1,4 +1,25 @@
+# ESP-IDF generated build artifacts and local SDK configuration
 build/
 sdkconfig
 sdkconfig.old
-.devcontainer
+
+# Python virtual environments & bytecode cache
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Recorded CSI session logs (local data)
+sessions/
+*.csv
+
+# Local IDE & user-specific settings
+.vscode/
+.devcontainer/
+.idea/
+
+# Local Word / Scratch documents
+*.doc
+*.docx
