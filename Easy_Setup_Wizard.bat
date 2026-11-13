@@ -802,6 +802,22 @@ function Invoke-AsyncCommand {
     return $exitCode
 }
 
+function Get-EffectiveBuildDir {
+    $defaultBuild = Join-Path $script:TargetRepoDir "build"
+    if ($script:TargetRepoDir.Length -le 85) {
+        return $defaultBuild
+    }
+    $shortRoot = "C:\Espressif\_csi_bld"
+    try {
+        if (-not (Test-Path $shortRoot)) {
+            New-Item -ItemType Directory -Force -Path $shortRoot -ErrorAction Stop | Out-Null
+        }
+        return $shortRoot
+    } catch {
+        return (Join-Path $env:LOCALAPPDATA "esp_csi_bld")
+    }
+}
+
 function Invoke-IdfCommand {
     param([string]$IdfArgs, [string]$WorkingDir, [int]$StepIndex = 8)
 
@@ -1063,43 +1079,66 @@ function Execute-Step {
             return $false
         }
         8 {
-            $buildDir      = Join-Path $script:TargetRepoDir "build"
+            $repoBuildDir  = Join-Path $script:TargetRepoDir "build"
+            $effBuildDir   = Get-EffectiveBuildDir
+            $usingShortDir = ($effBuildDir -ne $repoBuildDir)
+            $buildFlag     = if ($usingShortDir) { "-B `"$effBuildDir`" " } else { "" }
+
             $sdkConfigPath = Join-Path $script:TargetRepoDir "sdkconfig"
-            $binApp        = Join-Path $script:TargetRepoDir "build\project-name.bin"
-            $binBoot       = Join-Path $script:TargetRepoDir "build\bootloader\bootloader.bin"
-            $binPart       = Join-Path $script:TargetRepoDir "build\partition_table\partition-table.bin"
-            $projDesc      = Join-Path $script:TargetRepoDir "build\project_description.json"
-            $buildNinja    = Join-Path $script:TargetRepoDir "build\build.ninja"
-            $cmakeCache    = Join-Path $script:TargetRepoDir "build\CMakeCache.txt"
+            $binApp        = Join-Path $effBuildDir "project-name.bin"
+            $binBoot       = Join-Path $effBuildDir "bootloader\bootloader.bin"
+            $binPart       = Join-Path $effBuildDir "partition_table\partition-table.bin"
+            $projDesc      = Join-Path $effBuildDir "project_description.json"
+            $buildNinja    = Join-Path $effBuildDir "build.ninja"
+            $cmakeCache    = Join-Path $effBuildDir "CMakeCache.txt"
             $normTarget    = ($script:TargetRepoDir -replace '\\', '/')
 
+            if ($usingShortDir) {
+                Append-ConsoleLine "Long project path detected ($($script:TargetRepoDir.Length) chars); using short build cache: $effBuildDir"
+            }
+
             $cacheValid = $false
-            if (Test-Path $buildDir) {
+            if (Test-Path $effBuildDir) {
                 $hasCoreFiles = (Test-Path $cmakeCache) -and (Test-Path $projDesc) -and (Test-Path $buildNinja)
                 if ($hasCoreFiles) {
                     $cacheValid = [bool](Select-String -Path $cmakeCache -SimpleMatch $normTarget -Quiet -ErrorAction SilentlyContinue)
                 }
                 if (-not $cacheValid) {
                     Append-ConsoleLine "Cleaning incomplete or moved build directory..."
-                    Remove-Item -Path $buildDir -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item -Path $effBuildDir -Recurse -Force -ErrorAction SilentlyContinue
                 }
             }
 
             $alreadyValid = $cacheValid -and (Test-Path $binApp) -and (Test-Path $binBoot) -and (Test-Path $binPart) -and (Test-Path $sdkConfigPath) -and (Select-String -Path $sdkConfigPath -Pattern "CONFIG_ESP_WIFI_CSI_ENABLED=y" -Quiet)
             if (-not $alreadyValid) {
                 if (-not (Test-Path $sdkConfigPath)) {
-                    [void](Invoke-IdfCommand -IdfArgs "set-target esp32" -WorkingDir $script:TargetRepoDir -StepIndex 8)
+                    [void](Invoke-IdfCommand -IdfArgs "${buildFlag}set-target esp32" -WorkingDir $script:TargetRepoDir -StepIndex 8)
                 }
-                $buildEc = Invoke-IdfCommand -IdfArgs "build" -WorkingDir $script:TargetRepoDir -StepIndex 8
+                $buildEc = Invoke-IdfCommand -IdfArgs "${buildFlag}build" -WorkingDir $script:TargetRepoDir -StepIndex 8
                 if ($buildEc -ne 0 -or -not (Test-Path $binApp)) {
-                    Append-ConsoleLine "Retrying clean build..."
-                    Remove-Item -Path $buildDir -Recurse -Force -ErrorAction SilentlyContinue
-                    [void](Invoke-IdfCommand -IdfArgs "build" -WorkingDir $script:TargetRepoDir -StepIndex 8)
+                    if (-not ((Test-Path $cmakeCache) -and (Test-Path $projDesc) -and (Test-Path $buildNinja))) {
+                        Append-ConsoleLine "Cleaning incomplete build cache and retrying..."
+                        Remove-Item -Path $effBuildDir -Recurse -Force -ErrorAction SilentlyContinue
+                    } else {
+                        Append-ConsoleLine "Retrying incremental build..."
+                    }
+                    [void](Invoke-IdfCommand -IdfArgs "${buildFlag}build" -WorkingDir $script:TargetRepoDir -StepIndex 8)
                 }
             }
 
             $ok = (Test-Path $binApp) -and (Test-Path $binBoot) -and (Test-Path $binPart) -and (Test-Path $sdkConfigPath) -and (Select-String -Path $sdkConfigPath -Pattern "CONFIG_ESP_WIFI_CSI_ENABLED=y" -Quiet)
             if ($ok) {
+                if ($usingShortDir) {
+                    try {
+                        New-Item -ItemType Directory -Force -Path (Join-Path $repoBuildDir "bootloader") -ErrorAction SilentlyContinue | Out-Null
+                        New-Item -ItemType Directory -Force -Path (Join-Path $repoBuildDir "partition_table") -ErrorAction SilentlyContinue | Out-Null
+                        Copy-Item -Path $binApp -Destination (Join-Path $repoBuildDir "project-name.bin") -Force
+                        Copy-Item -Path $binBoot -Destination (Join-Path $repoBuildDir "bootloader\bootloader.bin") -Force
+                        Copy-Item -Path $binPart -Destination (Join-Path $repoBuildDir "partition_table\partition-table.bin") -Force
+                        $flashArgsSrc = Join-Path $effBuildDir "flash_args"
+                        if (Test-Path $flashArgsSrc) { Copy-Item -Path $flashArgsSrc -Destination (Join-Path $repoBuildDir "flash_args") -Force }
+                    } catch {}
+                }
                 Append-ConsoleLine "Firmware build verified: build\project-name.bin"
             }
             return $ok
@@ -1109,6 +1148,8 @@ function Execute-Step {
                 $stepObj.Status = "Skipped"
                 return $true
             }
+            $effBuildDir = Get-EffectiveBuildDir
+            $buildFlag   = if ($effBuildDir -ne (Join-Path $script:TargetRepoDir "build")) { "-B `"$effBuildDir`" " } else { "" }
             $pyExe = Get-HostPythonExe
             while ($true) {
                 $portLines = & $pyExe -c "import serial.tools.list_ports; [print(f'{p.device}|{p.description}') for p in serial.tools.list_ports.comports() if p.vid is not None]" 2>&1
@@ -1130,7 +1171,7 @@ function Execute-Step {
                         return $true
                     }
                     foreach ($comPort in $confirm.Ports) {
-                        $fc = Invoke-IdfCommand -IdfArgs "-p $comPort erase-flash flash" -WorkingDir $script:TargetRepoDir -StepIndex 9
+                        $fc = Invoke-IdfCommand -IdfArgs "${buildFlag}-p $comPort erase-flash flash" -WorkingDir $script:TargetRepoDir -StepIndex 9
                         if ($fc -ne 0) { return $false }
                     }
                     return $true
@@ -1139,12 +1180,14 @@ function Execute-Step {
         }
         10 {
             $repo = $script:TargetRepoDir
+            $effBuildDir = Get-EffectiveBuildDir
+            $flashBFlag  = if ($effBuildDir -ne (Join-Path $repo "build")) { "-B '$effBuildDir' " } else { "" }
             try {
                 Set-Content -Path (Join-Path $AppsDir "1_Central_Control_GUI.bat") -Encoding ASCII -ErrorAction SilentlyContinue -Value "@echo off`r`ntitle ESP32 CSI Central Control`r`ncd /d `"$repo`"`r`npython central_control.py`r`nif %ERRORLEVEL% NEQ 0 py central_control.py`r`n"
                 Set-Content -Path (Join-Path $AppsDir "2_Web_Dashboard.bat") -Encoding ASCII -ErrorAction SilentlyContinue -Value "@echo off`r`ntitle ESP32 CSI Web Dashboard`r`ncd /d `"$repo`"`r`nstart `"`" `"http://localhost:5000`"`r`npython web_app.py %*`r`nif %ERRORLEVEL% NEQ 0 py web_app.py %*`r`n"
                 Set-Content -Path (Join-Path $AppsDir "3_CSI_Log_Viewer.bat") -Encoding ASCII -ErrorAction SilentlyContinue -Value "@echo off`r`ntitle ESP32 CSI Log Viewer`r`ncd /d `"$repo`"`r`npython csi_log_viewer.py`r`nif %ERRORLEVEL% NEQ 0 py csi_log_viewer.py`r`n"
                 Set-Content -Path (Join-Path $AppsDir "4_ESP_IDF_Terminal.bat") -Encoding ASCII -ErrorAction SilentlyContinue -Value "@echo off`r`ntitle ESP-IDF Terminal`r`ncd /d `"$repo`"`r`neim shell`r`n"
-                Set-Content -Path (Join-Path $AppsDir "5_Flash_ESP32.bat") -Encoding ASCII -ErrorAction SilentlyContinue -Value "@echo off`r`ntitle Flash ESP32`r`ncd /d `"$repo`"`r`nset /p COMPORT=`"Enter COM Port (e.g. COM9): `"`r`npowershell -NoProfile -ExecutionPolicy Bypass -Command `". '$IdfProfile'; Set-Location '$repo'; idf.py -p %COMPORT% erase-flash flash`"`r`npause`r`n"
+                Set-Content -Path (Join-Path $AppsDir "5_Flash_ESP32.bat") -Encoding ASCII -ErrorAction SilentlyContinue -Value "@echo off`r`ntitle Flash ESP32`r`ncd /d `"$repo`"`r`nset /p COMPORT=`"Enter COM Port (e.g. COM9): `"`r`npowershell -NoProfile -ExecutionPolicy Bypass -Command `". '$IdfProfile'; Set-Location '$repo'; idf.py ${flashBFlag}-p %COMPORT% erase-flash flash`"`r`npause`r`n"
             } catch {}
             return $true
         }

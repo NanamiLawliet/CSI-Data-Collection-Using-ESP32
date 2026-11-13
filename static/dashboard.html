@@ -471,6 +471,30 @@
             flex-wrap: wrap;
         }
 
+        .scale-custom-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .scale-custom-group input[type="number"] {
+            width: 54px;
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            color: var(--text-main);
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-family: 'JetBrains Mono', monospace;
+            text-align: center;
+        }
+
         .chart-canvas-wrapper {
             position: relative;
             height: 380px;
@@ -828,7 +852,13 @@
                     </div>
 
                     <button id="btn-smooth" class="btn btn-ghost btn-xs" onclick="toggleSmooth()" title="Signal smoothing filter (EMA)"><span id="smooth-icon">〰</span> <span id="smooth-text">Filter: Off</span></button>
-                    <button id="btn-scale" class="btn btn-ghost btn-xs" onclick="toggleScale()" title="Y-axis scale mode: Auto Zoom / Fixed Range"><span id="scale-icon">📐</span> <span id="scale-text">Scale: Auto</span></button>
+                    <button id="btn-scale" class="btn btn-ghost btn-xs" onclick="toggleScale()" title="Toggle manual / auto Y-axis scale"><span id="scale-icon">📐</span> <span id="scale-text">Scale: Auto</span></button>
+                    <div id="scale-inputs-wrap" class="scale-custom-group" style="display:none;">
+                        <label for="scale-min">Min:</label>
+                        <input type="number" id="scale-min" step="any" onchange="onManualScaleChange()" placeholder="Min">
+                        <label for="scale-max">Max:</label>
+                        <input type="number" id="scale-max" step="any" onchange="onManualScaleChange()" placeholder="Max">
+                    </div>
                     <button id="btn-pause" class="btn btn-ghost btn-xs" onclick="togglePause()">⏸ Pause</button>
                     <button class="btn btn-ghost btn-xs" onclick="clearData()">Clear</button>
                     <button id="btn-fullscreen" class="btn btn-ghost btn-xs" onclick="toggleFullscreen()" title="Fullscreen (Shortcut: F / Esc)"><span id="fs-icon">⛶</span> <span id="fs-text">Fullscreen</span></button>
@@ -1156,21 +1186,51 @@
         function updateYScale() {
             if (!chartInstance) return;
             const txt = document.getElementById('scale-text');
+            const wrap = document.getElementById('scale-inputs-wrap');
+            const minInput = document.getElementById('scale-min');
+            const maxInput = document.getElementById('scale-max');
+
             if (!isFixedScaleEnabled) {
                 delete chartInstance.options.scales.y.min;
                 delete chartInstance.options.scales.y.max;
                 if (txt) txt.textContent = 'Scale: Auto';
+                if (wrap) wrap.style.display = 'none';
             } else {
-                if (currentChartTab === 'rssi') {
-                    chartInstance.options.scales.y.min = -60;
-                    chartInstance.options.scales.y.max = 10;
-                    if (txt) txt.textContent = 'Scale: Fixed (-60..+10)';
+                if (wrap) wrap.style.display = 'inline-flex';
+                if (txt) txt.textContent = 'Scale: Manual';
+
+                // If inputs are currently empty, provide sensible defaults for the active tab
+                if (minInput && maxInput && (minInput.value === '' || maxInput.value === '')) {
+                    if (currentChartTab === 'rssi') {
+                        if (minInput.value === '') minInput.value = -60;
+                        if (maxInput.value === '') maxInput.value = 10;
+                    } else {
+                        if (minInput.value === '') minInput.value = 0;
+                        if (maxInput.value === '') maxInput.value = 70;
+                    }
+                }
+
+                const minVal = parseFloat(minInput.value);
+                const maxVal = parseFloat(maxInput.value);
+
+                if (!isNaN(minVal)) {
+                    chartInstance.options.scales.y.min = minVal;
                 } else {
-                    chartInstance.options.scales.y.min = 0;
-                    chartInstance.options.scales.y.max = 70;
-                    if (txt) txt.textContent = 'Scale: Fixed (0-70)';
+                    delete chartInstance.options.scales.y.min;
+                }
+
+                if (!isNaN(maxVal)) {
+                    chartInstance.options.scales.y.max = maxVal;
+                } else {
+                    delete chartInstance.options.scales.y.max;
                 }
             }
+        }
+
+        function onManualScaleChange() {
+            if (!isFixedScaleEnabled) return;
+            updateYScale();
+            renderCharts(true);
         }
 
         function toggleScale() {
