@@ -110,9 +110,16 @@ Install the Python libraries required by the Web Dashboard, Central Control GUI,
 python -m pip install --upgrade pip flask pyserial numpy matplotlib
 ```
 
-Verify that all libraries (including `tkinter`) are properly installed (`ALL_IMPORTS_OK` should be printed):
+> **Warning — Do NOT run `pip install serial`:**  
+> The package name for serial port communication in Python is **`pyserial`** (which provides `import serial` and `serial.Serial`). There is an unrelated package on PyPI named `serial` (`0.0.97`) that overwrites `pyserial`'s `serial/__init__.py` and causes `AttributeError: module 'serial' has no attribute 'Serial'`. If you ever install `serial` by mistake, fix it with:
+> ```powershell
+> python -m pip uninstall -y serial
+> python -m pip install --force-reinstall pyserial
+> ```
+
+Verify that all libraries (including `tkinter` and `serial.Serial`) are properly installed (`ALL_IMPORTS_OK` should be printed):
 ```powershell
-python -c "import tkinter, serial, flask, numpy, matplotlib; print('ALL_IMPORTS_OK')"
+python -c "import tkinter, serial, flask, numpy, matplotlib; assert hasattr(serial, 'Serial'); print('ALL_IMPORTS_OK')"
 ```
 
 ---
@@ -198,6 +205,12 @@ This project uses a **single unified (generic) firmware image** for all ESP32 bo
    idf.py -p COM9 flash
    idf.py -p COM10 flash
    ```
+   > **Tip — First-Time Flash or When Switching SDK Versions (`erase-flash`):**  
+   > Standard `idf.py flash` only overwrites the application partition (`0x10000`) and leaves the non-volatile storage (`nvs` / `phy_init` at `0x9000`–`0x10000`) untouched. If a board has stale or corrupted Wi-Fi / RF calibration data in NVS, it may boot normally and accept commands over USB Serial, but fail to transmit or receive any Wi-Fi packets (`ESP-NOW status = FAIL` / `callbacks=0`). When flashing a board for the first time (or if no CSI data appears), perform a full flash erase + flash:
+   > ```powershell
+   > idf.py -p COM9 erase-flash flash
+   > idf.py -p COM10 erase-flash flash
+   > ```
    > **Important:** Do **NOT** leave `idf.py monitor` running after flashing. Only one program can hold a Windows COM port open at a time, and an active serial monitor will block `central_control.py` and `web_app.py` from connecting.
 
 ---
@@ -274,3 +287,24 @@ For convenience, ready-to-use batch launchers are provided in the `Desktop\apps`
 4. **Include Errors or Squiggly Lines in VS Code:**
    * **Cause:** The `build/compile_commands.json` file has not been generated yet.
    * **Solution:** Run `idf.py build` once so CMake generates `build/compile_commands.json`, then reload the VS Code window.
+5. **No CSI Data in `csi_log_viewer.py` / `web_app.py` (`ESP-NOW status = FAIL` on TX & `callbacks=0` on RX):**
+   * **Symptom:** Both ESP32 boards are detected in `central_control.py`, roles (`RECEIVER` and `TRANSMITTER`) apply and save properly, and `csi_log_viewer.py` records a `.csv` file containing only the header row (`0 rows`). Checking serial logs shows `ESP-NOW status = FAIL` on the Transmitter and `DIAG: CSI diag: callbacks=0 matches=0` on the Receiver—even after rebuilding and running `idf.py flash`.
+   * **Cause:** Stale or corrupted Wi-Fi / PHY RF calibration data cached inside the ESP32's NVS flash partition (`0x9000`–`0x10000`). Because `CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=y`, `CONFIG_ESP_PHY_RF_CAL_PARTIAL=y`, and `CONFIG_ESP_WIFI_NVS_ENABLED=y` are enabled in `sdkconfig`, the ESP32 loads cached RF calibration parameters from NVS on boot. Because `idf.py flash` does not erase NVS, corrupted RF calibration data persists across reflashes and leaves the 2.4 GHz radio unable to transmit or receive frames.
+   * **Solution:** Erase the NVS and PHY calibration region (`0x9000` to `0x10000`) on **all** ESP32 boards (or run `idf.py -p COMx erase-flash flash`) so each board performs a fresh RF calibration on boot, then re-assign their roles in `central_control.py`:
+     ```powershell
+     # Option A: Erase only the NVS + PHY calibration region (fast, keeps firmware intact)
+     & "C:\Espressif\tools\python\v5.5.5\venv\Scripts\python.exe" -m esptool --chip esp32 -p COM9 erase_region 0x9000 0x7000
+     & "C:\Espressif\tools\python\v5.5.5\venv\Scripts\python.exe" -m esptool --chip esp32 -p COM11 erase_region 0x9000 0x7000
+
+     # Option B: Full flash erase and re-flash inside an ESP-IDF terminal
+     idf.py -p COM9 erase-flash flash
+     idf.py -p COM11 erase-flash flash
+     ```
+     > **Note:** Erasing NVS resets the boards back to `IDLE` role. Open `py central_control.py` afterwards and click **Apply Configuration** for your `RECEIVER` and `TRANSMITTER` boards.
+6. **`AttributeError: module 'serial' has no attribute 'Serial'` When Connecting or Scanning Ports:**
+   * **Cause:** Installing `pip install serial` instead of `pip install pyserial` installs an unrelated serialization package (`serial 0.0.97`) that shadows `pyserial` and removes `serial.Serial`.
+   * **Solution:** Uninstall `serial` and force-reinstall `pyserial`:
+     ```powershell
+     python -m pip uninstall -y serial
+     python -m pip install --force-reinstall pyserial
+     ```

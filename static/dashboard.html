@@ -1162,9 +1162,9 @@
                 if (txt) txt.textContent = 'Ölçek: Otomatik';
             } else {
                 if (currentChartTab === 'rssi') {
-                    chartInstance.options.scales.y.min = -90;
-                    chartInstance.options.scales.y.max = 0;
-                    if (txt) txt.textContent = 'Ölçek: Sabit (-90-0)';
+                    chartInstance.options.scales.y.min = -60;
+                    chartInstance.options.scales.y.max = 10;
+                    if (txt) txt.textContent = 'Ölçek: Sabit (-60..+10)';
                 } else {
                     chartInstance.options.scales.y.min = 0;
                     chartInstance.options.scales.y.max = 70;

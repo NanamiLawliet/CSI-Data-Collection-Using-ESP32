@@ -37,6 +37,7 @@ class CentralControlApp:
                              background="#1e1e1e", 
                              foreground="#ffffff", 
                              fieldbackground="#1e1e1e",
+                             rowheight=28,
                              borderwidth=0,
                              font=("Consolas", 10))
         self.style.configure("Treeview.Heading", 
@@ -95,7 +96,10 @@ class CentralControlApp:
         lbl_title.pack(side=tk.LEFT)
         
         btn_refresh = ttk.Button(top_frame, text="Scan COM Ports Now", command=self.trigger_manual_scan)
-        btn_refresh.pack(side=tk.RIGHT)
+        btn_refresh.pack(side=tk.RIGHT, padx=(8, 0))
+
+        btn_web = ttk.Button(top_frame, text="Open Web Dashboard", style="Action.TButton", command=self.launch_web_dashboard)
+        btn_web.pack(side=tk.RIGHT)
 
         # Main Paned Window
         paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg="#121212", bd=0, sashwidth=5)
@@ -280,6 +284,14 @@ class CentralControlApp:
     def trigger_manual_scan(self):
         self.log_message("Triggering manual serial port scan...")
         threading.Thread(target=self.scan_serial_ports, args=(True,), daemon=True).start()
+
+    def launch_web_dashboard(self):
+        import subprocess, sys, webbrowser
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        web_script = os.path.join(base_dir, "web_app.py")
+        subprocess.Popen([sys.executable, web_script], cwd=base_dir)
+        webbrowser.open("http://localhost:5000")
+        self.close()
 
     def periodic_serial_scan(self):
         # Scan once on startup to discover plugged boards without resetting them in a loop
